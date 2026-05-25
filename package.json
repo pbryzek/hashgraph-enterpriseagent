@@ -1,0 +1,32 @@
+{
+  "name": "carbonsustain-hedera-agent",
+  "version": "1.0.0",
+  "description": "CarbonSustain agent with NatureBackers plugin on Hedera Agent Kit",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "build:client": "cd client && npm run build",
+    "dev:client": "cd client && npm run dev"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@hashgraph/proto": "^2.25.0",
+    "@hashgraph/sdk": "^2.72.0",
+    "@hashgraphonline/standards-agent-kit": "^0.2.166",
+    "@langchain/anthropic": "^0.3.0",
+    "@langchain/core": "^0.3.0",
+    "@langchain/google-genai": "^0.2.0",
+    "@langchain/openai": "^0.6.0",
+    "axios": "^1.7.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "hedera-agent-kit": "^2.0.3",
+    "langchain": "^0.3.0",
+    "zod": "^3.23.8"
+  }
+}
