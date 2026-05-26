@@ -39,3 +39,37 @@ body {
   font-size: 0.8rem;
   color: #6b7280;
 }
+
+.app-header__text {
+  flex: 1;
+}
+
+.hbar-ticker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 20px;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.hbar-ticker__label {
+  font-weight: 700;
+  color: #166534;
+  letter-spacing: 0.06em;
+}
+
+.hbar-ticker__price {
+  color: #111827;
+  font-weight: 500;
+}
+
+.hbar-ticker__change {
+  font-weight: 600;
+}
+
+.hbar-ticker__change.up   { color: #16a34a; }
+.hbar-ticker__change.down { color: #dc2626; }

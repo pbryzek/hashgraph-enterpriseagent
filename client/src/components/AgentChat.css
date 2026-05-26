@@ -7,6 +7,7 @@
   padding: 0 16px 16px;
 }
 
+
 .examples {
   padding: 24px 0 8px;
 }
@@ -64,8 +65,22 @@
   background: #f9fafb;
   border: 1px solid #e5e7eb;
   color: #111827;
-  white-space: pre-wrap;
 }
+
+/* ── Markdown content inside assistant bubbles ─────────────────── */
+.markdown p          { margin: 0 0 8px; }
+.markdown p:last-child { margin-bottom: 0; }
+.markdown strong     { font-weight: 600; }
+.markdown em         { font-style: italic; }
+.markdown ul,
+.markdown ol         { margin: 4px 0 8px 18px; padding: 0; }
+.markdown li         { margin-bottom: 4px; }
+.markdown h1,
+.markdown h2,
+.markdown h3         { font-size: 0.95rem; font-weight: 600; margin: 8px 0 4px; }
+.markdown code       { background: #e5e7eb; border-radius: 3px; padding: 1px 4px; font-size: 0.85em; }
+.markdown pre        { background: #e5e7eb; border-radius: 6px; padding: 8px 12px; overflow-x: auto; }
+.markdown hr         { border: none; border-top: 1px solid #e5e7eb; margin: 8px 0; }
 
 .message--error {
   align-self: flex-start;

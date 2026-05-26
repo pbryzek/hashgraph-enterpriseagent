@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
 import './AgentChat.css';
 
 const HASHSCAN_BASE = 'https://hashscan.io/testnet/transaction';
@@ -32,7 +33,6 @@ export default function AgentChat() {
     const userMsg = { role: 'user', content: trimmed };
     setMessages((prev) => [...prev, userMsg]);
 
-    // Build chat history from existing messages (exclude the one we just added)
     const history = messages.map((m) => ({ role: m.role, content: m.content }));
 
     try {
@@ -52,7 +52,7 @@ export default function AgentChat() {
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
-        buffer = lines.pop(); // keep incomplete line
+        buffer = lines.pop();
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
@@ -122,7 +122,13 @@ export default function AgentChat() {
       <div className="messages">
         {messages.map((m, i) => (
           <div key={i} className={`message message--${m.role}`}>
-            <p className="message-content">{m.content}</p>
+            {m.role === 'assistant' ? (
+              <div className="message-content markdown">
+                <ReactMarkdown>{m.content}</ReactMarkdown>
+              </div>
+            ) : (
+              <p className="message-content">{m.content}</p>
+            )}
             {m.txIds?.map((id) => (
               <a
                 key={id}
