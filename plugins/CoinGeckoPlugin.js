@@ -48,7 +48,7 @@ class GetHbarPriceTool extends BaseHederaQueryTool {
   }
 }
 
-export class CoinCapPlugin extends BasePlugin {
+export class CoinGeckoPlugin extends BasePlugin {
   id      = 'coincap-plugin';
   name    = 'CoinCap Plugin';
   description = 'Provides live HBAR price and market data via the CoinCap API';

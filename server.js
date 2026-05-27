@@ -8,6 +8,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import { HumanMessage, AIMessage } from '@langchain/core/messages';
 import { initAgent } from './agent.js';
 
 const app = express();
@@ -34,13 +35,14 @@ app.post('/api/agent', async (req, res) => {
   const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
   const txIds = [];
+  const toolOutputs = []; // collect tool results to recover from empty LLM summaries
 
   try {
     send({ type: 'status', step: 'Agent started…' });
 
     const langchainHistory = chatHistory.flatMap(({ role, content }) => {
-      if (role === 'user') return [{ type: 'human', content }];
-      if (role === 'assistant') return [{ type: 'ai', content }];
+      if (role === 'user') return [new HumanMessage(content)];
+      if (role === 'assistant') return [new AIMessage(content)];
       return [];
     });
 
@@ -49,17 +51,21 @@ app.post('/api/agent', async (req, res) => {
       {
         callbacks: [
           {
-            handleToolStart(_tool, _input, _runId, _parentRunId, _tags, _metadata, toolName) {
-              send({ type: 'tool_start', step: `Calling ${toolName}…` });
+            handleToolStart(tool, _input, _runId, _parentRunId, _tags, _metadata, runName) {
+              const name = tool?.name ?? runName ?? 'tool';
+              send({ type: 'tool_start', step: `Calling ${name}…` });
             },
-            handleToolEnd(output) {
+            handleToolEnd(rawOutput) {
               try {
-                const parsed = JSON.parse(output);
+                const parsed = JSON.parse(rawOutput);
+                // hedera-agent-kit wraps results as { success, data }
+                const text = parsed?.data ?? parsed?.output ?? rawOutput;
+                toolOutputs.push(typeof text === 'string' ? text : JSON.stringify(text));
                 if (parsed.transactionId) txIds.push(parsed.transactionId);
                 if (parsed.receipt?.transactionId)
                   txIds.push(String(parsed.receipt.transactionId));
               } catch {
-                // output is not JSON; ignore
+                toolOutputs.push(rawOutput);
               }
               send({ type: 'tool_end', step: 'Tool completed' });
             },
@@ -71,9 +77,28 @@ app.post('/api/agent', async (req, res) => {
       }
     );
 
+    // Gemini-flash-lite sometimes returns 0 tokens after tool execution.
+    // Rather than retrying (which would re-run write tools), surface the
+    // collected tool outputs directly as the response.
+    let output = result.output;
+    if (Array.isArray(output)) {
+      output = output
+        .filter((b) => b?.type === 'text' || typeof b === 'string')
+        .map((b) => (typeof b === 'string' ? b : b.text ?? ''))
+        .join('\n')
+        .trim();
+    } else if (typeof output !== 'string') {
+      output = String(output ?? '');
+    }
+
+    // If Gemini returned nothing after tool calls, show the tool results directly
+    if (!output && toolOutputs.length > 0) {
+      output = toolOutputs.join('\n\n---\n\n');
+    }
+
     send({
       type: 'done',
-      output: result.output,
+      output,
       txIds: [...new Set(txIds)],
     });
   } catch (err) {

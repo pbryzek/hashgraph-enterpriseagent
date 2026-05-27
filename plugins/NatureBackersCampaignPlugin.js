@@ -3,10 +3,11 @@
  * via the Nature Backers REST API at https://d3chyxfaxhbtc9.cloudfront.net
  *
  * Tools:
- *   nb_get_departments    →  GET  /department          (discover valid dept IDs)
- *   nb_create_campaign    →  POST /campaign            (multipart/form-data)
- *   nb_get_campaigns      →  GET  /campaign
- *   nb_assign_projects    →  POST /campaign-project/assign
+ *   nb_get_departments       →  GET  /department          (discover valid dept IDs)
+ *   nb_create_campaign       →  POST /campaign            (multipart/form-data)
+ *   nb_get_campaigns         →  GET  /campaign
+ *   nb_assign_projects       →  POST /campaign-project/assign
+ *   nb_get_votes_by_campaign →  GET  /campaign/{id}       (extracts tx_hash → Hedera mirror node)
  */
 
 import axios from 'axios';
@@ -15,6 +16,61 @@ import { BasePlugin, BaseHederaQueryTool } from 'hedera-agent-kit';
 import FormData from 'form-data';
 
 const NB_BASE_URL = 'https://d3chyxfaxhbtc9.cloudfront.net';
+
+// ── Hedera mirror node helpers ─────────────────────────────────────────────────
+
+function mirrorNodeBase() {
+  const network = (process.env.HEDERA_NETWORK || 'testnet').toLowerCase();
+  return network === 'mainnet'
+    ? 'https://mainnet-public.mirrornode.hedera.com'
+    : 'https://testnet.mirrornode.hedera.com';
+}
+
+/**
+ * ABI-decode the 5-param vote contract call:
+ *   castVote(string campaignKey, uint256 departmentId, string voterEmail, uint256 reserved, string voteJson)
+ *
+ * Encoding layout (after 4-byte selector):
+ *   slot 0  [bytes   0-31]  → byte offset to campaignKey string
+ *   slot 1  [bytes  32-63]  → departmentId (uint256)
+ *   slot 2  [bytes  64-95]  → byte offset to voterEmail string
+ *   slot 3  [bytes  96-127] → reserved uint256
+ *   slot 4  [bytes 128-159] → byte offset to voteJson string
+ *   <string data at the offsets above: 32-byte length prefix + UTF-8 bytes>
+ */
+function decodeVoteParams(functionParams) {
+  if (!functionParams || functionParams.length < 10) return null;
+  // strip 0x prefix + 4-byte (8 hex char) selector
+  const data = (functionParams.startsWith('0x') ? functionParams.slice(2) : functionParams).slice(8);
+
+  function uint256AtByte(byteOffset) {
+    const h = byteOffset * 2;
+    return Number(BigInt('0x' + data.slice(h, h + 64)));
+  }
+
+  function stringAtByteOffset(byteOffset) {
+    const h = byteOffset * 2;
+    const len = Number(BigInt('0x' + data.slice(h, h + 64)));
+    return Buffer.from(data.slice(h + 64, h + 64 + len * 2), 'hex').toString('utf8');
+  }
+
+  try {
+    const off0 = uint256AtByte(0);    // offset → campaignKey
+    const deptId = uint256AtByte(32); // departmentId
+    const off2 = uint256AtByte(64);   // offset → voterEmail
+    const off4 = uint256AtByte(128);  // offset → voteJson
+
+    const campaignKey = stringAtByteOffset(off0);
+    const voterEmail  = stringAtByteOffset(off2);
+    const rawJson     = stringAtByteOffset(off4);
+    let vote = null;
+    try { vote = JSON.parse(rawJson); } catch { /* leave null */ }
+
+    return { campaignKey, departmentId: deptId, voterEmail, vote };
+  } catch {
+    return null;
+  }
+}
 
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -240,6 +296,92 @@ class AssignProjectsTool extends BaseHederaQueryTool {
   }
 }
 
+// ── nb_get_votes_by_campaign ──────────────────────────────────────────────────
+
+const GetVotesByCampaignSchema = z.object({
+  campaignId: z.number().int().min(1).describe('Numeric ID of the campaign to retrieve votes for.'),
+});
+
+class GetVotesByCampaignTool extends BaseHederaQueryTool {
+  name = 'nb_get_votes_by_campaign';
+  description =
+    'Retrieve on-chain vote data for a Nature Backers campaign. ' +
+    'Fetches the campaign from the NB API, extracts its tx_hash, then queries the ' +
+    'Hedera mirror node to decode the vote recorded in the smart contract call. ' +
+    'Returns voter info, project voted for, reason, timestamps, and Hedera transaction details.';
+  specificInputSchema = GetVotesByCampaignSchema;
+  namespace = 'nature-backers-campaign';
+
+  async executeQuery({ campaignId }) {
+    this.logger.info(`NB get_votes_by_campaign campaignId=${campaignId}`);
+
+    // Step 1 — fetch campaign detail (includes tx_hash)
+    const campResp = await axios.get(`${NB_BASE_URL}/campaign/${campaignId}`, { timeout: 15_000 });
+    const campaign = campResp.data?.data ?? campResp.data;
+
+    if (!campaign) return `Campaign ${campaignId} not found.`;
+
+    const txHash = campaign.tx_hash;
+    if (!txHash) {
+      return (
+        `Campaign "${campaign.name}" (ID: ${campaignId}) has no on-chain votes recorded yet.\n` +
+        `Voting style: ${campaign.votingStyle || 'unknown'}\n` +
+        `Period: ${campaign.startDate?.slice(0,10)} → ${campaign.endDate?.slice(0,10)}`
+      );
+    }
+
+    // Step 2 — query Hedera mirror node for the EVM contract result
+    let contractResult;
+    try {
+      const mirrorResp = await axios.get(
+        `${mirrorNodeBase()}/api/v1/contracts/results/${txHash}`,
+        { timeout: 15_000 }
+      );
+      contractResult = mirrorResp.data;
+    } catch (err) {
+      return (
+        `Campaign "${campaign.name}" (ID: ${campaignId})\n` +
+        `tx_hash found but Hedera mirror node lookup failed: ${err.message}\n` +
+        `tx_hash: ${txHash}`
+      );
+    }
+
+    // Step 3 — decode ABI-encoded vote payload from function_parameters
+    const decoded = decodeVoteParams(contractResult.function_parameters);
+    const vote = decoded?.vote;
+
+    const lines = [
+      `Campaign: "${campaign.name}" (ID: ${campaignId})`,
+      `Voting style: ${campaign.votingStyle || 'unknown'}`,
+      '',
+      `── Hedera On-Chain Record ──`,
+      `Transaction hash: ${txHash}`,
+      `Contract (Hedera): ${contractResult.contract_id}`,
+      `Block:             ${contractResult.block_number}`,
+      `Consensus time:    ${contractResult.timestamp}`,
+      `Status:            ${contractResult.result}`,
+      `Gas used:          ${contractResult.gas_used?.toLocaleString()} / ${contractResult.gas_limit?.toLocaleString()}`,
+    ];
+
+    if (vote) {
+      lines.push('');
+      lines.push(`── Decoded Vote ──`);
+      lines.push(`Vote ID:       ${vote.voteId}`);
+      lines.push(`Voter:         ${vote.userName} (user ID ${vote.userId})`);
+      if (decoded.voterEmail) lines.push(`Voter email:   ${decoded.voterEmail}`);
+      lines.push(`Project voted: ${vote.projectName} (project ID ${vote.projectId})`);
+      lines.push(`Department:    ${decoded.departmentId}`);
+      lines.push(`Reason:        ${vote.reason || '(none)'}`);
+      lines.push(`Recorded at:   ${vote.createdAt}`);
+    } else if (contractResult.function_parameters) {
+      lines.push('');
+      lines.push('(Vote payload present but could not be decoded — raw function_parameters available)');
+    }
+
+    return lines.join('\n');
+  }
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 export class NatureBackersCampaignPlugin extends BasePlugin {
@@ -258,6 +400,7 @@ export class NatureBackersCampaignPlugin extends BasePlugin {
       new CreateCampaignTool({ hederaKit: context.config.hederaKit, logger: context.logger }),
       new GetCampaignsTool({ hederaKit: context.config.hederaKit, logger: context.logger }),
       new AssignProjectsTool({ hederaKit: context.config.hederaKit, logger: context.logger }),
+      new GetVotesByCampaignTool({ hederaKit: context.config.hederaKit, logger: context.logger }),
     ];
   }
 

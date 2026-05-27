@@ -1,7 +1,12 @@
 /**
- * agent.js — creates the Hedera Agent Kit executor with two plugins:
- *   HederaSustainabilityProjectPlugin  (sp_* tools — source/browse projects)
- *   NatureBackersCampaignPlugin        (nb_* tools — create/manage campaigns)
+ * agent.js — creates the Hedera Agent Kit executor with plugins:
+ *   HederaSustainabilityProjectPlugin  (sp_* — source/browse projects)
+ *   NatureBackersCampaignPlugin        (nb_* — create/manage campaigns)
+ *   CarbonPaymentPlugin                (transfer_hbar, submit_hcs_message — write tools)
+ *   CoinGeckoPlugin                    (get_hbar_price)
+ *
+ * Enterprise middleware wraps every tool with hooks (pre/post logging) and
+ * policies (HBAR transfer limits, memo enforcement) before the agent sees them.
  */
 
 import 'dotenv/config';
@@ -10,11 +15,12 @@ import { ChatPromptTemplate, MessagesPlaceholder } from '@langchain/core/prompts
 import { AgentExecutor, createToolCallingAgent } from 'langchain/agents';
 import { HederaSustainabilityProjectPlugin } from './plugins/HederaSustainabilityProjectPlugin.js';
 import { NatureBackersCampaignPlugin } from './plugins/NatureBackersCampaignPlugin.js';
-import { CoinCapPlugin } from './plugins/CoinCapPlugin.js';
+import { CoinGeckoPlugin } from './plugins/CoinGeckoPlugin.js';
+import { CarbonPaymentPlugin } from './plugins/CarbonPaymentPlugin.js';
 
 const SYSTEM_PROMPT = `
-You are a Nature Backers campaign assistant. You help users create sustainability campaigns
-by first identifying the most relevant projects, then creating a campaign around them.
+You are CarbonSustain's enterprise agent — a Nature Backers campaign assistant with
+blockchain payment and audit capabilities on Hedera.
 
 Your Hedera operator account is {operator_id}.
 
@@ -53,10 +59,19 @@ Immediately after nb_create_campaign succeeds, call nb_assign_projects with:
 - The NB Project IDs (integers) from Step 2 — these are labeled "NB Project ID" in the search results.
   Do NOT use the Hedera consensus timestamp (the long decimal string) for this step.
 
+### Step 5: HBAR Payments (Carbon Payment Plugin)
+If the user wants to fund a campaign, pay a project, or transfer HBAR:
+- Use transfer_hbar — always include a descriptive memo (required by enterprise policy)
+- Enterprise policy limits single transfers to 50 HBAR max
+- After any payment, call submit_hcs_message to record the action on-chain as an audit trail
+
 ### Plugin Routing Rules:
-- **Sustainability Projects plugin** (sp_*): ONLY for sourcing, searching, or retrieving projects — never for creating campaigns
-- **Nature Backers plugin** (nb_*): ONLY for creating or managing campaigns — never for sourcing projects
-- **CoinCap plugin** (get_hbar_price): call whenever the user asks about the HBAR price, value, market cap, or any Hedera token market data
+- **Sustainability Projects plugin** (sp_*): ONLY for sourcing, searching, or retrieving projects
+- **Nature Backers plugin** (nb_*): for creating/managing campaigns and querying on-chain votes
+  - nb_get_votes_by_campaign: retrieves the on-chain vote stored on Hedera for any campaign ID
+- **Carbon Payment plugin**: for HBAR payments, HCS audit records, and Hedera EVM tx lookups
+  - hedera_get_contract_result: look up any EVM tx hash on the Hedera mirror node
+- **CoinGecko plugin** (get_hbar_price): call whenever the user asks about HBAR price or market data
 - Never skip Step 2 to go directly to campaign creation
 - Never call nb_create_campaign without confirmed project IDs from sp_search_projects
 
@@ -71,6 +86,84 @@ You: [calls nb_create_campaign({{ name: "...", votingStyle: "STORY_FEATURE", sta
 You: [calls nb_assign_projects({{ campaignId: <id>, projectIds: [...] }})]
 `.trim();
 
+// ── Enterprise hooks + policies middleware ─────────────────────────────────────
+//
+// Wraps every LangChain tool with:
+//   Hooks   — pre/post execution logging (structured audit trail)
+//   Policies — parameter validation rules enforced before any tool runs
+
+const ENTERPRISE_HOOKS = {
+  async onPreToolExecution(toolName, params) {
+    console.log(
+      `[ENTERPRISE AUDIT] ▶ ${toolName} | ${new Date().toISOString()} | params: ${JSON.stringify(params)}`
+    );
+  },
+  async onPostToolExecution(toolName, result) {
+    const preview = String(result).slice(0, 150);
+    console.log(`[ENTERPRISE AUDIT] ✓ ${toolName} | result: ${preview}${result?.length > 150 ? '…' : ''}`);
+  },
+};
+
+const ENTERPRISE_POLICIES = [
+  {
+    name: 'HBAR transfer spend limit',
+    validate(toolName, params) {
+      if (toolName === 'transfer_hbar') {
+        const amount = Number(params?.amount ?? 0);
+        if (amount > 50) {
+          throw new Error(
+            `Enterprise policy violation [${this.name}]: ` +
+            `requested ${amount} HBAR exceeds the 50 HBAR per-transfer limit. ` +
+            `Break into smaller transfers or escalate for manual approval.`
+          );
+        }
+      }
+    },
+  },
+  {
+    name: 'Transfer memo required',
+    validate(toolName, params) {
+      if (toolName === 'transfer_hbar' && !params?.memo?.trim()) {
+        throw new Error(
+          `Enterprise policy violation [${this.name}]: ` +
+          `HBAR transfers must include a memo (project ID or campaign name) for audit trail compliance.`
+        );
+      }
+    },
+  },
+];
+
+function applyEnterpriseMiddleware(tools) {
+  return tools.map(tool => {
+    const originalInvoke = tool.invoke.bind(tool);
+    tool.invoke = async (input, runManager) => {
+      let params;
+      try {
+        params = typeof input === 'string' ? JSON.parse(input) : input;
+      } catch {
+        params = input;
+      }
+
+      for (const policy of ENTERPRISE_POLICIES) {
+        policy.validate(tool.name, params);
+      }
+
+      await ENTERPRISE_HOOKS.onPreToolExecution(tool.name, params);
+      const result = await originalInvoke(input, runManager);
+      await ENTERPRISE_HOOKS.onPostToolExecution(tool.name, result);
+
+      return result;
+    };
+    return tool;
+  });
+}
+
+// ── LLM factory ────────────────────────────────────────────────────────────────
+
+// Switch providers by setting LLM_PROVIDER in .env:
+//   LLM_PROVIDER=gemini    → Google Gemini (GOOGLE_API_KEY, GEMINI_MODEL)
+//   LLM_PROVIDER=openai    → OpenAI       (OPENAI_API_KEY, OPENAI_MODEL_NAME)
+//   LLM_PROVIDER=anthropic → Anthropic    (ANTHROPIC_API_KEY, ANTHROPIC_MODEL)
 async function buildLlm() {
   const provider = (process.env.LLM_PROVIDER || 'openai').toLowerCase();
 
@@ -92,6 +185,7 @@ async function buildLlm() {
     });
   }
 
+  // Default: OpenAI
   const { ChatOpenAI } = await import('@langchain/openai');
   return new ChatOpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -113,7 +207,8 @@ export async function initAgent() {
       plugins: [
         new HederaSustainabilityProjectPlugin(),
         new NatureBackersCampaignPlugin(),
-        new CoinCapPlugin(),
+        new CoinGeckoPlugin(),
+        new CarbonPaymentPlugin(),
       ],
     },
     'autonomous'
@@ -121,7 +216,8 @@ export async function initAgent() {
 
   await kit.initialize();
 
-  const tools = kit.getAggregatedLangChainTools();
+  const rawTools = kit.getAggregatedLangChainTools();
+  const tools = applyEnterpriseMiddleware(rawTools);
   const operatorId = signer.getAccountId().toString();
   const systemMessage = SYSTEM_PROMPT.replace('{operator_id}', operatorId);
 

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, Component } from 'react';
 import ReactMarkdown from 'react-markdown';
 import './AgentChat.css';
 
@@ -11,6 +11,73 @@ const EXAMPLE_PROMPTS = [
   'What nature-based solutions projects involve reforestation?',
 ];
 
+// ── Error boundary — catches render crashes so the whole page never goes blank ─
+class MessageErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { crashed: false };
+  }
+  static getDerivedStateFromError() {
+    return { crashed: true };
+  }
+  render() {
+    if (this.state.crashed) {
+      return (
+        <div className="message message--error">
+          <p className="message-content">Could not render this message.</p>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ── Safe markdown renderer ────────────────────────────────────────────────────
+function SafeMarkdown({ content }) {
+  if (!content || typeof content !== 'string') return null;
+  return <ReactMarkdown>{content}</ReactMarkdown>;
+}
+
+// ── Single message bubble ─────────────────────────────────────────────────────
+function MessageBubble({ m }) {
+  return (
+    <MessageErrorBoundary>
+      <div className={`message message--${m.role}`}>
+        {m.role === 'assistant' ? (
+          <div className="message-content markdown">
+            <SafeMarkdown content={m.content} />
+          </div>
+        ) : (
+          <p className="message-content">{m.content ?? ''}</p>
+        )}
+        {m.txIds?.map((id) => (
+          <a
+            key={id}
+            className="hashscan-link"
+            href={`${HASHSCAN_BASE}/${id}`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            View tx {id} on Hashscan ↗
+          </a>
+        ))}
+      </div>
+    </MessageErrorBoundary>
+  );
+}
+
+// ── Status / thinking indicator ───────────────────────────────────────────────
+function StatusBubble({ steps }) {
+  const latest = steps[steps.length - 1] ?? 'Agent thinking…';
+  return (
+    <div className="message message--status">
+      <p className="step">{latest}</p>
+      <span className="spinner" />
+    </div>
+  );
+}
+
+// ── Main chat component ───────────────────────────────────────────────────────
 export default function AgentChat() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -42,6 +109,10 @@ export default function AgentChat() {
         body: JSON.stringify({ message: trimmed, chatHistory: history }),
       });
 
+      if (!res.ok) {
+        throw new Error(`Server error ${res.status}`);
+      }
+
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -60,7 +131,7 @@ export default function AgentChat() {
             const event = JSON.parse(line.slice(6));
             handleEvent(event);
           } catch {
-            // malformed chunk; ignore
+            // malformed SSE chunk — skip
           }
         }
       }
@@ -80,18 +151,25 @@ export default function AgentChat() {
       case 'tool_start':
       case 'llm_start':
       case 'status':
-        setSteps((prev) => [...prev, event.step]);
+        if (event.step) setSteps((prev) => [...prev, event.step]);
         break;
-      case 'done':
-        setMessages((prev) => [
-          ...prev,
-          { role: 'assistant', content: event.output, txIds: event.txIds || [] },
-        ]);
+      case 'tool_end':
+        // keep the last tool step visible until llm_start replaces it
         break;
+      case 'done': {
+        const output = typeof event.output === 'string' ? event.output.trim() : '';
+        if (output) {
+          setMessages((prev) => [
+            ...prev,
+            { role: 'assistant', content: output, txIds: event.txIds || [] },
+          ]);
+        }
+        break;
+      }
       case 'error':
         setMessages((prev) => [
           ...prev,
-          { role: 'error', content: event.error },
+          { role: 'error', content: event.error ?? 'An unknown error occurred.' },
         ]);
         break;
       default:
@@ -121,36 +199,10 @@ export default function AgentChat() {
 
       <div className="messages">
         {messages.map((m, i) => (
-          <div key={i} className={`message message--${m.role}`}>
-            {m.role === 'assistant' ? (
-              <div className="message-content markdown">
-                <ReactMarkdown>{m.content}</ReactMarkdown>
-              </div>
-            ) : (
-              <p className="message-content">{m.content}</p>
-            )}
-            {m.txIds?.map((id) => (
-              <a
-                key={id}
-                className="hashscan-link"
-                href={`${HASHSCAN_BASE}/${id}`}
-                target="_blank"
-                rel="noreferrer"
-              >
-                View tx {id} on Hashscan ↗
-              </a>
-            ))}
-          </div>
+          <MessageBubble key={i} m={m} />
         ))}
 
-        {loading && steps.length > 0 && (
-          <div className="message message--status">
-            {steps.map((s, i) => (
-              <p key={i} className="step">{s}</p>
-            ))}
-            <span className="spinner" />
-          </div>
-        )}
+        {loading && <StatusBubble steps={steps} />}
 
         <div ref={bottomRef} />
       </div>
@@ -170,7 +222,7 @@ export default function AgentChat() {
           onClick={() => sendMessage()}
           disabled={loading || !input.trim()}
         >
-          Send
+          {loading ? 'Thinking…' : 'Send'}
         </button>
       </div>
     </div>
