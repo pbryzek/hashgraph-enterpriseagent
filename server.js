@@ -9,13 +9,14 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { HumanMessage, AIMessage } from '@langchain/core/messages';
-import { initAgent } from './agent.js';
+import { initResearchAgent, initCampaignAgent } from './agent.js';
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-let executor;
+let researchExecutor;
+let campaignExecutor;
 
 // ── Health check ──────────────────────────────────────────────────────────────
 
@@ -24,8 +25,10 @@ app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 // ── Agent endpoint (SSE) ──────────────────────────────────────────────────────
 
 app.post('/api/agent', async (req, res) => {
-  const { message, chatHistory = [] } = req.body;
+  const { message, chatHistory = [], phase = 'research' } = req.body;
   if (!message) return res.status(400).json({ error: 'message is required' });
+
+  const executor = phase === 'campaign' ? campaignExecutor : researchExecutor;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -100,6 +103,7 @@ app.post('/api/agent', async (req, res) => {
       type: 'done',
       output,
       txIds: [...new Set(txIds)],
+      phase,
     });
   } catch (err) {
     console.error('Agent error:', err);
@@ -126,9 +130,12 @@ if (process.env.NODE_ENV === 'production') {
 
 const PORT = process.env.PORT || 3001;
 
-console.log('Initializing Hedera agent…');
-executor = await initAgent();
-console.log('Agent ready.');
+console.log('Initializing agents…');
+[researchExecutor, campaignExecutor] = await Promise.all([
+  initResearchAgent(),
+  initCampaignAgent(),
+]);
+console.log('Agents ready.');
 
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);

@@ -232,6 +232,101 @@ const FAKE_PROJECTS = [
       }
     })],
   },
+
+  // ── Bay Area / Women's Sports partner projects ────────────────────────────
+  // These are surfaced when the agent searches for SF Glens, Bay Area,
+  // California, NWSL, women's sports, or soccer-adjacent keywords.
+
+  {
+    nbProjectId: 6,
+    consensusTimestamp: '1700000006.000000000',
+    uuid: 'fake-proj-006',
+    analytics: { schemaName: 'Project', policyId: 'fake-policy-006' },
+    documents: [JSON.stringify({
+      credentialSubject: {
+        projectName: 'SF Bay Coastal Restoration — Glens "Kick for Conservation" Partner Project',
+        description: 'Native habitat restoration along 12 miles of San Francisco Bay shoreline, removing invasive species and replanting coastal scrub, riparian willows, and eelgrass meadows. Co-branded with the SF Glens NWSL club — one tree planted per home goal scored.',
+        projectType: 'Coastal & Wetland Restoration',
+        country: 'United States',
+        region: 'San Francisco Bay Area, California',
+        impactAndRiskSdgs: ['SDG 13 - Climate Action', 'SDG 14 - Life Below Water', 'SDG 15 - Life on Land'],
+        partnerOrg: 'San Francisco Glens (NWSL)',
+        sportsCampaignTag: 'women-sports bay-area soccer nwsl sf-glens california',
+      }
+    })],
+  },
+  {
+    nbProjectId: 7,
+    consensusTimestamp: '1700000007.000000000',
+    uuid: 'fake-proj-007',
+    analytics: { schemaName: 'Project', policyId: 'fake-policy-007' },
+    documents: [JSON.stringify({
+      credentialSubject: {
+        projectName: 'Oakland Urban Forest — Roots SC & Valkyries Green Goals Initiative',
+        description: 'Planting 5,000 trees in under-canopied Oakland neighborhoods to reduce urban heat islands and sequester carbon. Partner campaign with Oakland Roots SC women\'s team and the Golden State Valkyries WNBA — fan votes determine which neighborhoods receive trees first.',
+        projectType: 'Urban Reforestation',
+        country: 'United States',
+        region: 'Oakland, San Francisco Bay Area, California',
+        impactAndRiskSdgs: ['SDG 11 - Sustainable Cities', 'SDG 13 - Climate Action', 'SDG 15 - Life on Land'],
+        partnerOrg: 'Oakland Roots SC / Golden State Valkyries (WNBA)',
+        sportsCampaignTag: 'women-sports bay-area basketball wnba soccer oakland california valkyries',
+      }
+    })],
+  },
+  {
+    nbProjectId: 8,
+    consensusTimestamp: '1700000008.000000000',
+    uuid: 'fake-proj-008',
+    analytics: { schemaName: 'Project', policyId: 'fake-policy-008' },
+    documents: [JSON.stringify({
+      credentialSubject: {
+        projectName: 'Stanford Dish Open Space Biochar & Soil Restoration',
+        description: 'Applying biochar derived from invasive French broom to degraded grassland soils on the Stanford University Dish reserve, sequestering carbon while restoring native bunchgrass habitat. Linked to the Stanford Cardinal women\'s soccer and lacrosse programs — one acre restored per shutout victory.',
+        projectType: 'Biochar & Grassland Restoration',
+        country: 'United States',
+        region: 'Stanford, Palo Alto, San Francisco Bay Area, California',
+        impactAndRiskSdgs: ['SDG 13 - Climate Action', 'SDG 15 - Life on Land', 'SDG 4 - Quality Education'],
+        partnerOrg: 'Stanford Cardinal Women\'s Soccer / Stanford Cardinal Women\'s Lacrosse',
+        sportsCampaignTag: 'women-sports bay-area soccer lacrosse stanford ncaa california college',
+      }
+    })],
+  },
+  {
+    nbProjectId: 9,
+    consensusTimestamp: '1700000009.000000000',
+    uuid: 'fake-proj-009',
+    analytics: { schemaName: 'Project', policyId: 'fake-policy-009' },
+    documents: [JSON.stringify({
+      credentialSubject: {
+        projectName: 'Pacific Flyway Wetlands — Golden Gate Roller Derby Blue Carbon Campaign',
+        description: 'Protecting 800 acres of tidal marsh in the Suisun Marsh and Napa-Sonoma wetlands to preserve a critical Pacific Flyway stopover and sequester blue carbon. Partnered with Golden Gate Roller Derby — bout wins unlock funding tranches voted on by fans.',
+        projectType: 'Wetland Conservation & Blue Carbon',
+        country: 'United States',
+        region: 'Suisun Marsh / Napa-Sonoma Wetlands, San Francisco Bay Area, California',
+        impactAndRiskSdgs: ['SDG 13 - Climate Action', 'SDG 14 - Life Below Water', 'SDG 15 - Life on Land'],
+        partnerOrg: 'Golden Gate Roller Derby',
+        sportsCampaignTag: 'women-sports bay-area roller-derby wetlands california',
+      }
+    })],
+  },
+  {
+    nbProjectId: 10,
+    consensusTimestamp: '1700000010.000000000',
+    uuid: 'fake-proj-010',
+    analytics: { schemaName: 'Project', policyId: 'fake-policy-010' },
+    documents: [JSON.stringify({
+      credentialSubject: {
+        projectName: 'Cal Bears Trail & Watershed Restoration — Berkeley Hills Conservation',
+        description: 'Restoring 3 miles of degraded stream channel and riparian corridor in Strawberry Creek and Claremont Canyon Regional Preserve, adjacent to UC Berkeley campus. Tied to Cal women\'s lacrosse and volleyball — ace serves and draw controls trigger fan-directed tree sponsorships.',
+        projectType: 'Watershed & Riparian Restoration',
+        country: 'United States',
+        region: 'Berkeley, San Francisco Bay Area, California',
+        impactAndRiskSdgs: ['SDG 6 - Clean Water', 'SDG 13 - Climate Action', 'SDG 15 - Life on Land'],
+        partnerOrg: 'Cal Bears Women\'s Lacrosse / Cal Bears Women\'s Volleyball',
+        sportsCampaignTag: 'women-sports bay-area lacrosse volleyball ncaa california cal berkeley college',
+      }
+    })],
+  },
 ];
 
 function typeKeywords(type) {
@@ -249,12 +344,26 @@ function fakeSearch({ query, sdgs, type }) {
   let results = FAKE_PROJECTS;
 
   // Text query — stem each word so "wetlands" matches "wetland"
+  // Also matches sportsCampaignTag, region, and partnerOrg fields
   if (query) {
     const keywords = typeKeywords(query);
     results = results.filter(p => {
       const hay = JSON.stringify(p).toLowerCase();
       return keywords.some(kw => hay.includes(kw));
     });
+  }
+
+  // If still empty after a specific query, fall back to all Bay Area projects
+  // so the agent always has something to work with for SF / California searches
+  if (results.length === 0 && query) {
+    const bayAreaTerms = ['bay area', 'san francisco', 'california', 'oakland', 'sf', 'soccer', 'nwsl', 'women'];
+    const q = query.toLowerCase();
+    if (bayAreaTerms.some(t => q.includes(t))) {
+      results = FAKE_PROJECTS.filter(p =>
+        JSON.stringify(p).toLowerCase().includes('california') ||
+        JSON.stringify(p).toLowerCase().includes('bay area')
+      );
+    }
   }
 
   // SDG filter

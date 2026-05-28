@@ -5,7 +5,13 @@ import './AgentChat.css';
 const HASHSCAN_BASE = 'https://hashscan.io/testnet/transaction';
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
-const EXAMPLE_PROMPTS = [
+const RESEARCH_PROMPTS = [
+  'Find women\'s sports teams in the San Francisco Bay Area for a Nature Backers campaign.',
+  'What are the top women\'s sports organizations in Los Angeles I should target?',
+  'Identify women\'s college sports programs in Texas with strong sustainability alignment.',
+];
+
+const CAMPAIGN_PROMPTS = [
   'Find water sustainability projects in East Africa.',
   'Search for SDG 6 clean water projects I can feature in a fan campaign.',
   'What nature-based solutions projects involve reforestation?',
@@ -83,6 +89,8 @@ export default function AgentChat() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [steps, setSteps] = useState([]);
+  const [phase, setPhase] = useState('research');
+  const [showTransition, setShowTransition] = useState(false);
   const bottomRef = useRef(null);
 
   useEffect(() => {
@@ -96,6 +104,7 @@ export default function AgentChat() {
     setInput('');
     setLoading(true);
     setSteps([]);
+    setShowTransition(false);
 
     const userMsg = { role: 'user', content: trimmed };
     setMessages((prev) => [...prev, userMsg]);
@@ -106,7 +115,7 @@ export default function AgentChat() {
       const res = await fetch(`${API_BASE}/api/agent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: trimmed, chatHistory: history }),
+        body: JSON.stringify({ message: trimmed, chatHistory: history, phase }),
       });
 
       if (!res.ok) {
@@ -164,6 +173,8 @@ export default function AgentChat() {
             { role: 'assistant', content: output, txIds: event.txIds || [] },
           ]);
         }
+        // Show campaign transition button after research responses
+        if (event.phase === 'research') setShowTransition(true);
         break;
       }
       case 'error':
@@ -184,12 +195,50 @@ export default function AgentChat() {
     }
   }
 
+  const examplePrompts = phase === 'research' ? RESEARCH_PROMPTS : CAMPAIGN_PROMPTS;
+
+  function handleTransitionToCampaign() {
+    setPhase('campaign');
+    setShowTransition(false);
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: 'assistant',
+        content:
+          'Switching to campaign creation mode. Which team or event from the recommendations above would you like to feature? I\'ll help you find matching sustainability projects and create the campaign.',
+        txIds: [],
+      },
+    ]);
+  }
+
   return (
     <div className="chat-container">
+      <div className="phase-bar">
+        <span className={`phase-badge ${phase === 'research' ? 'phase-badge--active' : ''}`}>
+          1 · Sports Research
+        </span>
+        <span className="phase-arrow">→</span>
+        <span className={`phase-badge ${phase === 'campaign' ? 'phase-badge--active' : ''}`}>
+          2 · Campaign Creation
+        </span>
+        {phase === 'campaign' && (
+          <button
+            className="phase-reset"
+            onClick={() => { setPhase('research'); setShowTransition(false); }}
+          >
+            ← Back to Research
+          </button>
+        )}
+      </div>
+
       {messages.length === 0 && (
         <div className="examples">
-          <p className="examples-label">Try an example:</p>
-          {EXAMPLE_PROMPTS.map((p) => (
+          <p className="examples-label">
+            {phase === 'research'
+              ? 'Find women\'s sports partners for a Nature Backers campaign:'
+              : 'Try an example:'}
+          </p>
+          {examplePrompts.map((p) => (
             <button key={p} className="example-chip" onClick={() => sendMessage(p)}>
               {p}
             </button>
@@ -204,6 +253,15 @@ export default function AgentChat() {
 
         {loading && <StatusBubble steps={steps} />}
 
+        {showTransition && !loading && (
+          <div className="transition-banner">
+            <p>Ready to build a campaign around one of these organizations?</p>
+            <button className="transition-btn" onClick={handleTransitionToCampaign}>
+              Create a Nature Backers Campaign →
+            </button>
+          </div>
+        )}
+
         <div ref={bottomRef} />
       </div>
 
@@ -214,7 +272,11 @@ export default function AgentChat() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Ask the CarbonSustain agent…"
+          placeholder={
+            phase === 'research'
+              ? 'Ask about women\'s sports organizations in a city or region…'
+              : 'Ask the CarbonSustain campaign agent…'
+          }
           disabled={loading}
         />
         <button
