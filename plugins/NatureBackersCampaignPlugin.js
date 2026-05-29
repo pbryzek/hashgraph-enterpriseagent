@@ -310,31 +310,37 @@ class CreateCampaignTool extends BaseHederaQueryTool {
     const statusName = campaign?.campaignStatus?.name ?? `ID ${campaign?.campaignStatusId}`;
     const depts    = fmtCampaignDepartments(campaign?.CampaignDepartment);
 
-    const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
-    const votingUrl   = `${frontendUrl}/vote/${id}`;
+    const frontendUrl = (process.env.NATURE_BACKERS_FRONTEND_URL || 'https://main.d2falv1xg02otc.amplifyapp.com').replace(/\/$/, '');
+    const votingUrl   = `${frontendUrl}/auth/signin/?campaignId=${id}`;
     const qrCodeUrl   = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(votingUrl)}`;
 
-    // Record campaign creation on HCS
-    const audit = await recordCrossChainAudit({
-      eventType: 'CAMPAIGN_CREATED',
-      entityId:  `campaign-${id}`,
-      actor:     'agent',
-      payload: {
-        campaignId: id,
-        name,
-        votingStyle: resolvedStyle,
-        startDate:   resolvedStart,
-        endDate:     resolvedEnd,
-        departmentIds: resolvedDeptIds,
-        votingUrl,
-        timestamp: new Date().toISOString(),
-      },
-      tags: ['campaign', `campaign-${id}`, 'creation'],
-    });
-
-    const hcsLine = audit.hcs?.simulated
-      ? `HCS: simulated (set AUDIT_HCS_TOPIC_ID to record on-chain)`
-      : `HCS: tx=${audit.hcs?.tx_hash}  seq#=${audit.hcs?.sequenceNumber}`;
+    // Record campaign creation on HCS — failure here must never block the campaign response
+    let hcsLine = 'HCS: skipped (audit error)';
+    let auditId = '(audit unavailable)';
+    try {
+      const audit = await recordCrossChainAudit({
+        eventType: 'CAMPAIGN_CREATED',
+        entityId:  `campaign-${id}`,
+        actor:     'agent',
+        payload: {
+          campaignId: id,
+          name,
+          votingStyle: resolvedStyle,
+          startDate:   resolvedStart,
+          endDate:     resolvedEnd,
+          departmentIds: resolvedDeptIds,
+          votingUrl,
+          timestamp: new Date().toISOString(),
+        },
+        tags: ['campaign', `campaign-${id}`, 'creation'],
+      });
+      auditId = audit.summary?.auditId ?? '(none)';
+      hcsLine = audit.hcs?.simulated
+        ? `HCS: simulated (set AUDIT_HCS_TOPIC_ID to record on-chain)`
+        : `HCS: tx=${audit.hcs?.tx_hash}  seq#=${audit.hcs?.sequenceNumber}`;
+    } catch (auditErr) {
+      this.logger.warn(`NB create_campaign: HCS audit failed — ${auditErr.message}`);
+    }
 
     return [
       `Campaign created successfully.`,
@@ -348,7 +354,7 @@ class CreateCampaignTool extends BaseHederaQueryTool {
       `departments:\n${depts}`,
       `votingUrl: ${votingUrl}`,
       `qrCodeUrl: ${qrCodeUrl}`,
-      `auditId: ${audit.summary.auditId}`,
+      `auditId: ${auditId}`,
       hcsLine,
     ].join('\n');
   }
@@ -419,42 +425,69 @@ class GetCampaignTool extends BaseHederaQueryTool {
 class SearchNBProjectsTool extends BaseHederaQueryTool {
   name = 'nb_search_projects';
   description =
-    'Search the NatureBackers database for projects and return their integer NB Project IDs. ' +
-    'Use this to find the correct integer project IDs BEFORE calling nb_assign_projects. ' +
-    'sp_search_projects only returns Guardian indexer IDs — this tool returns the NB integer IDs needed for campaign assignment. ' +
-    'Optionally filter by a keyword matched against project name or type.';
+    'PRIMARY tool for finding projects to feature in a campaign. ' +
+    'Searches the NatureBackers platform database — this has richer coverage than the Guardian indexer for campaign assignment. ' +
+    'Returns NB integer project IDs (required by nb_assign_projects), full names, types, SDGs, location, and methodology. ' +
+    'Use keyword to filter: e.g. "wetland", "coastal", "reforestation", "watershed", "bay area", "mangrove", "solar", "biochar". ' +
+    'Omit keyword to list ALL available projects. ' +
+    'Always call this (not sp_search_projects) when a user asks to find projects for a campaign.';
   specificInputSchema = z.object({
-    keyword: z.string().optional().describe('Optional keyword to filter by project name or type (case-insensitive).'),
+    keyword: z.string().optional().describe(
+      'Filter keyword matched against project name, type, sector, methodology, and SDG names. ' +
+      'Examples: "wetland", "coastal", "bay area", "watershed", "mangrove", "reforestation", "solar", "climate".'
+    ),
+    sdg: z.number().int().min(1).max(17).optional().describe(
+      'Filter by SDG number. Returns only projects tagged with this SDG.'
+    ),
   });
   namespace = 'nature-backers-campaign';
 
-  async executeQuery({ keyword }) {
-    this.logger.info(`NB search_projects keyword="${keyword ?? ''}"`);
+  async executeQuery({ keyword, sdg }) {
+    this.logger.info(`NB search_projects keyword="${keyword ?? ''}" sdg=${sdg}`);
     const resp = await axios.get(`${NB_BASE_URL}/project`, { timeout: 15_000 });
     const raw = resp.data?.data ?? resp.data ?? [];
-
     let projects = Array.isArray(raw) ? raw : [];
+
+    // Skip internal/workflow documents
+    const SKIP_NAMES = ['Create Project Design Document (PDD)', 'Create Monitoring Report (MR)', 'Verify project', 'VVB Verification Report'];
+    projects = projects.filter(p => !SKIP_NAMES.includes(p.projectName));
+
     if (keyword) {
       const kw = keyword.toLowerCase();
-      projects = projects.filter(p =>
-        (p.projectName ?? '').toLowerCase().includes(kw) ||
-        (p.projectTypes ?? '').toLowerCase().includes(kw) ||
-        (p.primarySector ?? '').toLowerCase().includes(kw)
-      );
+      projects = projects.filter(p => {
+        const sdgNames = (p.sdgs ?? []).map(s => (s.sdg?.name ?? '').toLowerCase()).join(' ');
+        return (p.projectName ?? '').toLowerCase().includes(kw) ||
+          (p.projectTypes ?? '').toLowerCase().includes(kw) ||
+          (p.primarySector ?? '').toLowerCase().includes(kw) ||
+          (p.projectMethodology ?? '').toLowerCase().includes(kw) ||
+          sdgNames.includes(kw);
+      });
+    }
+
+    if (sdg) {
+      projects = projects.filter(p => (p.sdgs ?? []).some(s => s.sdgId === sdg));
     }
 
     if (projects.length === 0) {
-      return keyword
-        ? `No NB projects found matching "${keyword}". Try a broader keyword or omit it to list all projects.`
-        : 'No projects found in the NatureBackers database.';
+      const hint = keyword || (sdg ? `SDG ${sdg}` : '');
+      return `No NB projects found matching "${hint}". Try a broader keyword (e.g. "coastal", "restoration", "water") or omit it to list all projects.`;
     }
 
-    const lines = projects.map(p =>
-      `- NB Project ID: ${p.id}  |  ${p.projectName ?? 'Unnamed'}` +
-      (p.projectTypes ? `  |  Type: ${p.projectTypes}` : '') +
-      (p.status ? `  |  Status: ${p.status}` : '')
-    );
-    return `NatureBackers projects${keyword ? ` matching "${keyword}"` : ''}:\n${lines.join('\n')}`;
+    const lines = projects.map(p => {
+      const sdgLabels = (p.sdgs ?? []).map(s => `SDG ${s.sdgId} - ${s.sdg?.name ?? ''}`).join(', ');
+      const location = [p.latitude != null ? `${p.latitude.toFixed(2)}°N` : null, p.longitude != null ? `${p.longitude.toFixed(2)}°E` : null].filter(Boolean).join(', ');
+      return [
+        `NB Project ID: ${p.id}  |  ${p.projectName ?? 'Unnamed'}`,
+        `  Type: ${p.projectTypes ?? 'N/A'}`,
+        p.primarySector ? `  Sector: ${p.primarySector}` : null,
+        p.projectMethodology ? `  Methodology: ${p.projectMethodology}` : null,
+        sdgLabels ? `  SDGs: ${sdgLabels}` : null,
+        location ? `  Location: ${location}` : null,
+        `  Status: ${p.status ?? 'N/A'}`,
+      ].filter(Boolean).join('\n');
+    });
+
+    return `NatureBackers projects${keyword ? ` matching "${keyword}"` : sdg ? ` with SDG ${sdg}` : ' (all)'}:\n\n${lines.join('\n\n')}`;
   }
 }
 
