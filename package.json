@@ -6,7 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js",
+    "dev": "node --watch --watch-path=. server.js",
     "build:client": "cd client && npm run build",
     "dev:client": "cd client && npm run dev"
   },
@@ -27,6 +27,7 @@
     "express": "^4.19.2",
     "hedera-agent-kit": "^2.0.3",
     "langchain": "^0.3.0",
+    "qrcode": "^1.5.4",
     "zod": "^3.23.8"
   }
 }

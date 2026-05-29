@@ -13,7 +13,7 @@
  * deterministic simulated tx_hash for demos without live CLPR beta access.
  *
  * Env vars:
- *   AUDIT_TOPIC_ID        — HCS topic (auto-simulated if blank)
+ *   AUDIT_HCS_TOPIC_ID    — HCS topic (also accepts AUDIT_TOPIC_ID; auto-simulated if blank)
  *   CLPR_ENDPOINT_URL     — e.g. https://clpr-beta.hashgraph.com/v1
  *   CLPR_API_KEY          — leave blank to simulate
  *   CLPR_SIMULATE=true    — force simulation even with a key
@@ -61,7 +61,7 @@ function getHederaClient() {
 // ── HCS write ─────────────────────────────────────────────────────────────────
 
 async function writeToHCS(payload, integrityHash) {
-  const topicId = process.env.AUDIT_TOPIC_ID;
+  const topicId = process.env.AUDIT_HCS_TOPIC_ID || process.env.AUDIT_TOPIC_ID;
   const message = JSON.stringify({ ...payload, integrityHash });
 
   if (!topicId) {

@@ -415,9 +415,9 @@ const SearchProjectsSchema = z.object({
     .number()
     .int()
     .min(1)
-    .max(50)
+    .max(100)
     .optional()
-    .describe('Max results to return (default 10).'),
+    .describe('Max results to return (default 10, max 100).'),
 });
 
 class SearchProjectsTool extends BaseHederaQueryTool {

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import AgentChat from './components/AgentChat.jsx';
+import VotePage from './components/VotePage.jsx';
 import './App.css';
 
 const COINGECKO_URL =
@@ -20,7 +21,7 @@ function HbarTicker() {
           change: hbar.usd_24h_change?.toFixed(2) ?? '0.00',
         });
       } catch {
-        // non-critical — silently skip
+        // non-critical
       }
     }
     fetch_();
@@ -42,7 +43,28 @@ function HbarTicker() {
   );
 }
 
+// Simple client-side routing without react-router-dom
+function usePathname() {
+  const [pathname, setPathname] = useState(window.location.pathname);
+
+  useEffect(() => {
+    const handler = () => setPathname(window.location.pathname);
+    window.addEventListener('popstate', handler);
+    return () => window.removeEventListener('popstate', handler);
+  }, []);
+
+  return pathname;
+}
+
 export default function App() {
+  const pathname = usePathname();
+
+  // /vote/:campaignId route
+  const voteMatch = pathname.match(/^\/vote\/(\d+)\/?$/);
+  if (voteMatch) {
+    return <VotePage campaignId={voteMatch[1]} />;
+  }
+
   return (
     <div className="app">
       <header className="app-header">

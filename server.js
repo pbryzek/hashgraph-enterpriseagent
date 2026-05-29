@@ -1,15 +1,20 @@
 /**
  * server.js — Express backend for CarbonSustain Hedera agent
  *
- * POST /api/agent  — SSE stream of agent steps + final result with tx IDs
- * GET  /health     — liveness check for Cloud Run
+ * POST /api/agent        — SSE stream of agent steps + final result with tx IDs
+ * GET  /api/campaigns/:id — proxy to NatureBackers campaign detail (for VotePage)
+ * POST /api/vote         — proxy vote submission (email → userId lookup + forward)
+ * GET  /health           — liveness check for Cloud Run
  */
 
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import axios from 'axios';
 import { HumanMessage, AIMessage } from '@langchain/core/messages';
 import { initResearchAgent, initCampaignAgent } from './agent.js';
+
+const NB_BASE_URL = 'https://d3chyxfaxhbtc9.cloudfront.net';
 
 const app = express();
 app.use(express.json());
@@ -21,6 +26,85 @@ let campaignExecutor;
 // ── Health check ──────────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
+// ── Campaign detail proxy (used by VotePage) ──────────────────────────────────
+
+app.get('/api/campaigns/:id', async (req, res) => {
+  try {
+    const resp = await axios.get(`${NB_BASE_URL}/campaign/${req.params.id}`, {
+      timeout: 15_000,
+      headers: process.env.NATURE_BACKERS_TOKEN
+        ? { Authorization: `Bearer ${process.env.NATURE_BACKERS_TOKEN}` }
+        : {},
+    });
+    res.json(resp.data);
+  } catch (err) {
+    const status = err?.response?.status ?? 500;
+    res.status(status).json({ error: err.message });
+  }
+});
+
+// ── Project detail proxy (used by VotePage) ───────────────────────────────────
+
+app.get('/api/projects/:id', async (req, res) => {
+  try {
+    const resp = await axios.get(`${NB_BASE_URL}/project/${req.params.id}`, {
+      timeout: 15_000,
+      headers: process.env.NATURE_BACKERS_TOKEN
+        ? { Authorization: `Bearer ${process.env.NATURE_BACKERS_TOKEN}` }
+        : {},
+    });
+    res.json(resp.data);
+  } catch (err) {
+    const status = err?.response?.status ?? 500;
+    res.status(status).json({ error: err.message });
+  }
+});
+
+// ── Vote proxy (QR code voting page) ─────────────────────────────────────────
+// Accepts { email, campaignId, projectId, reason? }
+// Resolves email → userId via GET /user/email/:email (NatureBackers API), then forwards vote
+
+app.post('/api/vote', async (req, res) => {
+  const { email, campaignId, projectId, reason } = req.body;
+
+  if (!email || !campaignId || !projectId) {
+    return res.status(400).json({ error: 'email, campaignId, and projectId are required.' });
+  }
+
+  try {
+    // Resolve email → userId using the NatureBackers user endpoint
+    const userResp = await axios.get(`${NB_BASE_URL}/user/email/${encodeURIComponent(email)}`, {
+      timeout: 15_000,
+      headers: process.env.NATURE_BACKERS_TOKEN
+        ? { Authorization: `Bearer ${process.env.NATURE_BACKERS_TOKEN}` }
+        : {},
+    });
+
+    const userId = userResp.data?.data?.id ?? userResp.data?.id;
+
+    if (!userId) {
+      return res.status(404).json({
+        error: `Email "${email}" is not registered in the Nature Backers system. Please use your work email.`,
+      });
+    }
+
+    // Submit the vote
+    const votePayload = { userId, campaignId: Number(campaignId), projectId: Number(projectId) };
+    if (reason) votePayload.reason = reason.slice(0, 500);
+
+    const voteResp = await axios.post(`${NB_BASE_URL}/vote`, votePayload, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 15_000,
+    });
+
+    res.json(voteResp.data);
+  } catch (err) {
+    const status = err?.response?.status ?? 500;
+    const message = err?.response?.data?.message ?? err.message;
+    res.status(status).json({ error: message });
+  }
+});
 
 // ── Agent endpoint (SSE) ──────────────────────────────────────────────────────
 
@@ -38,7 +122,9 @@ app.post('/api/agent', async (req, res) => {
   const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
   const txIds = [];
-  const toolOutputs = []; // collect tool results to recover from empty LLM summaries
+  const toolOutputs = [];
+  let currentToolName = null;
+  let pendingApproval = null; // set when nb_preview_campaign runs
 
   try {
     send({ type: 'status', step: 'Agent started…' });
@@ -56,17 +142,29 @@ app.post('/api/agent', async (req, res) => {
           {
             handleToolStart(tool, _input, _runId, _parentRunId, _tags, _metadata, runName) {
               const name = tool?.name ?? runName ?? 'tool';
+              currentToolName = name;
               send({ type: 'tool_start', step: `Calling ${name}…` });
             },
             handleToolEnd(rawOutput) {
               try {
                 const parsed = JSON.parse(rawOutput);
-                // hedera-agent-kit wraps results as { success, data }
                 const text = parsed?.data ?? parsed?.output ?? rawOutput;
-                toolOutputs.push(typeof text === 'string' ? text : JSON.stringify(text));
+                const textStr = typeof text === 'string' ? text : JSON.stringify(text);
+                toolOutputs.push(textStr);
                 if (parsed.transactionId) txIds.push(parsed.transactionId);
                 if (parsed.receipt?.transactionId)
                   txIds.push(String(parsed.receipt.transactionId));
+
+                // Detect campaign preview for approval flow
+                if (currentToolName === 'nb_preview_campaign') {
+                  try {
+                    const preview = JSON.parse(textStr);
+                    if (preview?.__type === 'campaign_preview') {
+                      pendingApproval = preview;
+                      send({ type: 'approval_request', campaignPreview: preview });
+                    }
+                  } catch { /* not JSON, ignore */ }
+                }
               } catch {
                 toolOutputs.push(rawOutput);
               }
@@ -80,9 +178,6 @@ app.post('/api/agent', async (req, res) => {
       }
     );
 
-    // Gemini-flash-lite sometimes returns 0 tokens after tool execution.
-    // Rather than retrying (which would re-run write tools), surface the
-    // collected tool outputs directly as the response.
     let output = result.output;
     if (Array.isArray(output)) {
       output = output
@@ -94,7 +189,6 @@ app.post('/api/agent', async (req, res) => {
       output = String(output ?? '');
     }
 
-    // If Gemini returned nothing after tool calls, show the tool results directly
     if (!output && toolOutputs.length > 0) {
       output = toolOutputs.join('\n\n---\n\n');
     }
@@ -104,6 +198,8 @@ app.post('/api/agent', async (req, res) => {
       output,
       txIds: [...new Set(txIds)],
       phase,
+      needsApproval: pendingApproval !== null,
+      campaignPreview: pendingApproval,
     });
   } catch (err) {
     console.error('Agent error:', err);

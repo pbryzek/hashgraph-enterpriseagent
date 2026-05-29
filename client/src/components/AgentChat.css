@@ -264,3 +264,95 @@
 .transition-btn:hover {
   background: #15803d;
 }
+
+/* ── Campaign Approval Card ──────────────────────────────────────────────── */
+.approval-card {
+  margin: 8px 0;
+  border-radius: 12px;
+  border: 1px solid rgba(234, 179, 8, 0.35);
+  background: rgba(234, 179, 8, 0.06);
+  overflow: hidden;
+}
+
+.approval-card__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  background: rgba(234, 179, 8, 0.1);
+  border-bottom: 1px solid rgba(234, 179, 8, 0.2);
+}
+
+.approval-card__icon {
+  font-size: 1rem;
+}
+
+.approval-card__title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fbbf24;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.approval-card__body {
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.approval-row {
+  display: flex;
+  gap: 12px;
+  font-size: 0.85rem;
+}
+
+.approval-label {
+  color: #6b7280;
+  min-width: 110px;
+  font-weight: 500;
+}
+
+.approval-value {
+  color: #e2e8f0;
+  flex: 1;
+}
+
+.approval-card__actions {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid rgba(234, 179, 8, 0.15);
+}
+
+.approval-btn {
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: none;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.approval-btn--approve {
+  background: #16a34a;
+  color: #fff;
+  flex: 1;
+}
+
+.approval-btn--approve:hover {
+  background: #15803d;
+}
+
+.approval-btn--cancel {
+  background: rgba(148, 163, 184, 0.12);
+  color: #94a3b8;
+  padding: 8px 12px;
+}
+
+.approval-btn--cancel:hover {
+  background: rgba(148, 163, 184, 0.2);
+  color: #e2e8f0;
+}

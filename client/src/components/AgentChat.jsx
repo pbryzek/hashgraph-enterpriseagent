@@ -17,7 +17,7 @@ const CAMPAIGN_PROMPTS = [
   'What nature-based solutions projects involve reforestation?',
 ];
 
-// ── Error boundary — catches render crashes so the whole page never goes blank ─
+// ── Error boundary ─────────────────────────────────────────────────────────────
 class MessageErrorBoundary extends Component {
   constructor(props) {
     super(props);
@@ -83,19 +83,73 @@ function StatusBubble({ steps }) {
   );
 }
 
+// ── Campaign approval card ────────────────────────────────────────────────────
+function ApprovalCard({ preview, onApprove, onCancel }) {
+  const start = preview.startDate ? new Date(preview.startDate).toLocaleString() : 'now + 1 min';
+  const end   = preview.endDate   ? new Date(preview.endDate).toLocaleString()   : 'start + 1 hr';
+
+  return (
+    <div className="approval-card">
+      <div className="approval-card__header">
+        <span className="approval-card__icon">📋</span>
+        <span className="approval-card__title">Campaign Preview — Awaiting Approval</span>
+      </div>
+      <div className="approval-card__body">
+        <div className="approval-row">
+          <span className="approval-label">Name</span>
+          <span className="approval-value">{preview.name}</span>
+        </div>
+        <div className="approval-row">
+          <span className="approval-label">Voting Style</span>
+          <span className="approval-value">{preview.votingStyle ?? 'STORY_FEATURE'}</span>
+        </div>
+        <div className="approval-row">
+          <span className="approval-label">Opens</span>
+          <span className="approval-value">{start}</span>
+        </div>
+        <div className="approval-row">
+          <span className="approval-label">Closes</span>
+          <span className="approval-value">{end}</span>
+        </div>
+        {preview.emailSubject && (
+          <div className="approval-row">
+            <span className="approval-label">Email Subject</span>
+            <span className="approval-value">{preview.emailSubject}</span>
+          </div>
+        )}
+        {preview.departmentIds?.length > 0 && (
+          <div className="approval-row">
+            <span className="approval-label">Departments</span>
+            <span className="approval-value">IDs: {preview.departmentIds.join(', ')}</span>
+          </div>
+        )}
+      </div>
+      <div className="approval-card__actions">
+        <button className="approval-btn approval-btn--approve" onClick={onApprove}>
+          ✅ Approve — Create Campaign
+        </button>
+        <button className="approval-btn approval-btn--cancel" onClick={onCancel}>
+          ✕ Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Main chat component ───────────────────────────────────────────────────────
 export default function AgentChat() {
-  const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [steps, setSteps] = useState([]);
-  const [phase, setPhase] = useState('research');
+  const [messages, setMessages]           = useState([]);
+  const [input, setInput]                 = useState('');
+  const [loading, setLoading]             = useState(false);
+  const [steps, setSteps]                 = useState([]);
+  const [phase, setPhase]                 = useState('research');
   const [showTransition, setShowTransition] = useState(false);
+  const [pendingApproval, setPendingApproval] = useState(null);
   const bottomRef = useRef(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, steps]);
+  }, [messages, steps, pendingApproval]);
 
   async function sendMessage(text = input) {
     const trimmed = text.trim();
@@ -105,6 +159,7 @@ export default function AgentChat() {
     setLoading(true);
     setSteps([]);
     setShowTransition(false);
+    setPendingApproval(null);
 
     const userMsg = { role: 'user', content: trimmed };
     setMessages((prev) => [...prev, userMsg]);
@@ -163,7 +218,11 @@ export default function AgentChat() {
         if (event.step) setSteps((prev) => [...prev, event.step]);
         break;
       case 'tool_end':
-        // keep the last tool step visible until llm_start replaces it
+        break;
+      case 'approval_request':
+        if (event.campaignPreview) {
+          setPendingApproval(event.campaignPreview);
+        }
         break;
       case 'done': {
         const output = typeof event.output === 'string' ? event.output.trim() : '';
@@ -173,8 +232,11 @@ export default function AgentChat() {
             { role: 'assistant', content: output, txIds: event.txIds || [] },
           ]);
         }
-        // Show campaign transition button after research responses
         if (event.phase === 'research') setShowTransition(true);
+        // If needsApproval flag is set but approval_request wasn't sent, fall back
+        if (event.needsApproval && event.campaignPreview && !pendingApproval) {
+          setPendingApproval(event.campaignPreview);
+        }
         break;
       }
       case 'error':
@@ -193,6 +255,20 @@ export default function AgentChat() {
       e.preventDefault();
       sendMessage();
     }
+  }
+
+  function handleApprove() {
+    const preview = pendingApproval;
+    setPendingApproval(null);
+    sendMessage(`APPROVE - please create the campaign as described in the preview (name: "${preview?.name}")`);
+  }
+
+  function handleCancelApproval() {
+    setPendingApproval(null);
+    setMessages((prev) => [
+      ...prev,
+      { role: 'assistant', content: 'Campaign creation cancelled. Let me know if you\'d like to adjust anything.', txIds: [] },
+    ]);
   }
 
   const examplePrompts = phase === 'research' ? RESEARCH_PROMPTS : CAMPAIGN_PROMPTS;
@@ -224,7 +300,7 @@ export default function AgentChat() {
         {phase === 'campaign' && (
           <button
             className="phase-reset"
-            onClick={() => { setPhase('research'); setShowTransition(false); }}
+            onClick={() => { setPhase('research'); setShowTransition(false); setPendingApproval(null); }}
           >
             ← Back to Research
           </button>
@@ -253,7 +329,15 @@ export default function AgentChat() {
 
         {loading && <StatusBubble steps={steps} />}
 
-        {showTransition && !loading && (
+        {pendingApproval && !loading && (
+          <ApprovalCard
+            preview={pendingApproval}
+            onApprove={handleApprove}
+            onCancel={handleCancelApproval}
+          />
+        )}
+
+        {showTransition && !loading && !pendingApproval && (
           <div className="transition-banner">
             <p>Ready to build a campaign around one of these organizations?</p>
             <button className="transition-btn" onClick={handleTransitionToCampaign}>

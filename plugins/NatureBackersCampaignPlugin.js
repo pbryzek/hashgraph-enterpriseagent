@@ -11,16 +11,21 @@
  *   6 = Cancelled — cancelled (no votes or manually cancelled)
  *
  * Tools:
+ *   nb_preview_campaign       →  Show campaign preview and wait for user approval
  *   nb_get_campaign_statuses  →  GET  /campaign-status
  *   nb_get_departments        →  GET  /department
  *   nb_create_campaign        →  POST /campaign  (multipart/form-data)
  *   nb_get_campaigns          →  GET  /campaign  (optional statusId filter)
  *   nb_get_campaign           →  GET  /campaign/:id  (full detail incl. projects + departments)
+ *   nb_search_projects        →  GET  /project  (search NB projects by keyword, returns integer IDs)
  *   nb_assign_projects        →  POST /campaign-project/assign
+ *   nb_cast_vote              →  POST /vote  (submit a vote for a project in a campaign)
  *   nb_get_campaign_votes     →  GET  /vote/campaign-votes/:id  (all votes with user + project)
  *   nb_get_hedera_votes       →  GET  /vote/hedera/:id          (votes from Hedera chain)
  *   nb_get_vote_proof         →  GET  /vote/proof/:id           (Merkle proof)
  *   nb_push_votes_to_hedera   →  POST /vote/hedera/:id          (push approved votes on-chain)
+ *   nb_record_campaign_report →  Compile final report and submit to HCS
+ *   nb_get_campaign_hcs_report→  Retrieve HCS-recorded campaign reports
  *   nb_get_votes_by_campaign  →  GET  /campaign/:id + Hedera mirror (decode on-chain tx)
  */
 
@@ -28,6 +33,7 @@ import axios from 'axios';
 import { z } from 'zod';
 import { BasePlugin, BaseHederaQueryTool } from 'hedera-agent-kit';
 import FormData from 'form-data';
+import { recordCrossChainAudit, getAuditLogs } from './crossChainAudit.js';
 
 const NB_BASE_URL = 'https://d3chyxfaxhbtc9.cloudfront.net';
 
@@ -127,14 +133,63 @@ function fmtCampaignSummary(c) {
 
 function defaultStartDate() {
   const d = new Date();
-  d.setDate(d.getDate() + 1);
-  d.setUTCHours(8, 0, 0, 0);
+  d.setMinutes(d.getMinutes() + 1);
   return d.toISOString();
 }
 function defaultEndDate(startIso) {
   const d = new Date(startIso);
-  d.setMonth(d.getMonth() + 1);
+  d.setHours(d.getHours() + 1);
   return d.toISOString();
+}
+
+// ── Shared campaign schema ─────────────────────────────────────────────────────
+
+const CampaignSchema = z.object({
+  name:         z.string().describe('Unique campaign name.'),
+  votingStyle:  z.enum(['TOKEN_BASED', 'STORY_FEATURE', 'THEMED_BADGES']).optional()
+                 .describe('Voting style. Defaults to STORY_FEATURE.'),
+  startDate:    z.string().optional().describe('ISO 8601 start date. Defaults to 1 minute from now.'),
+  endDate:      z.string().optional().describe('ISO 8601 end date. Defaults to 1 hour after startDate.'),
+  emailSubject: z.string().optional().describe('Campaign invitation email subject.'),
+  emailBody:    z.string().optional().describe('Campaign invitation email body.'),
+  departmentIds: z.array(z.number().int().min(1)).optional()
+                  .describe('Department IDs to include. Call nb_get_departments first. Defaults to [1].'),
+  imageUrl:     z.string().optional().describe('Public image URL for the campaign banner. Only provide if you have a real, publicly accessible URL. Omit if uncertain — a placeholder will be used automatically.'),
+});
+
+// ── nb_preview_campaign ───────────────────────────────────────────────────────
+
+class PreviewCampaignTool extends BaseHederaQueryTool {
+  name = 'nb_preview_campaign';
+  description =
+    'Show a campaign preview to the user and request their approval BEFORE creating it. ' +
+    'ALWAYS call this tool before nb_create_campaign. ' +
+    'Returns a structured preview the user must approve. Only proceed with nb_create_campaign after receiving APPROVE.';
+  specificInputSchema = CampaignSchema;
+  namespace = 'nature-backers-campaign';
+
+  async executeQuery({ name, votingStyle, startDate, endDate, emailSubject, emailBody, departmentIds, imageUrl }) {
+    const resolvedStyle   = votingStyle   ?? 'STORY_FEATURE';
+    const resolvedStart   = startDate     ?? defaultStartDate();
+    const resolvedEnd     = endDate       ?? defaultEndDate(resolvedStart);
+    const resolvedDeptIds = departmentIds ?? [1];
+
+    this.logger.info(`NB preview_campaign "${name}"`);
+
+    const preview = {
+      __type:       'campaign_preview',
+      name,
+      votingStyle:  resolvedStyle,
+      startDate:    resolvedStart,
+      endDate:      resolvedEnd,
+      emailSubject: emailSubject ?? null,
+      emailBody:    emailBody    ?? null,
+      departmentIds: resolvedDeptIds,
+      imageUrl:     imageUrl     ?? null,
+    };
+
+    return JSON.stringify(preview);
+  }
 }
 
 // ── nb_get_campaign_statuses ──────────────────────────────────────────────────
@@ -201,26 +256,13 @@ class GetDepartmentsTool extends BaseHederaQueryTool {
 
 // ── nb_create_campaign ────────────────────────────────────────────────────────
 
-const CreateCampaignSchema = z.object({
-  name:         z.string().describe('Unique campaign name.'),
-  votingStyle:  z.enum(['TOKEN_BASED', 'STORY_FEATURE', 'THEMED_BADGES']).optional()
-                 .describe('Voting style. Defaults to STORY_FEATURE.'),
-  startDate:    z.string().optional().describe('ISO 8601 start date. Must be in the future.'),
-  endDate:      z.string().optional().describe('ISO 8601 end date. Must be after startDate.'),
-  emailSubject: z.string().optional().describe('Campaign invitation email subject.'),
-  emailBody:    z.string().optional().describe('Campaign invitation email body.'),
-  departmentIds: z.array(z.number().int().min(1)).optional()
-                  .describe('Department IDs to include. Call nb_get_departments first. Defaults to [1].'),
-  imageUrl:     z.string().optional().describe('Public image URL for the campaign banner.'),
-});
-
 class CreateCampaignTool extends BaseHederaQueryTool {
   name = 'nb_create_campaign';
   description =
     'Create a new Nature Backers sustainability campaign. ' +
-    'Only call after the user has confirmed the projects to feature. ' +
-    'Returns the new campaign ID and full campaign object including status, departments, and image URL.';
-  specificInputSchema = CreateCampaignSchema;
+    'ONLY call this AFTER nb_preview_campaign has been shown AND the user has explicitly said APPROVE. ' +
+    'Returns the new campaign ID, voting URL, and a QR code the user can scan to vote.';
+  specificInputSchema = CampaignSchema;
   namespace = 'nature-backers-campaign';
 
   async executeQuery({ name, votingStyle, startDate, endDate, emailSubject, emailBody, departmentIds, imageUrl }) {
@@ -240,16 +282,22 @@ class CreateCampaignTool extends BaseHederaQueryTool {
     if (emailBody)    form.append('emailBody', emailBody);
     form.append('departmentIds', JSON.stringify(resolvedDeptIds));
 
+    const placeholder = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+      'base64'
+    );
+
     if (imageUrl) {
-      const imgResp = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 10_000 });
-      const contentType = imgResp.headers['content-type'] || 'image/png';
-      const ext = contentType.split('/')[1] || 'png';
-      form.append('file', Buffer.from(imgResp.data), { filename: `campaign-banner.${ext}`, contentType });
+      try {
+        const imgResp = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 10_000 });
+        const contentType = imgResp.headers['content-type'] || 'image/png';
+        const ext = contentType.split('/')[1] || 'png';
+        form.append('file', Buffer.from(imgResp.data), { filename: `campaign-banner.${ext}`, contentType });
+      } catch {
+        this.logger.warn(`NB create_campaign: could not fetch imageUrl "${imageUrl}" — using placeholder`);
+        form.append('file', placeholder, { filename: 'placeholder.png', contentType: 'image/png' });
+      }
     } else {
-      const placeholder = Buffer.from(
-        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-        'base64'
-      );
       form.append('file', placeholder, { filename: 'placeholder.png', contentType: 'image/png' });
     }
 
@@ -262,18 +310,46 @@ class CreateCampaignTool extends BaseHederaQueryTool {
     const statusName = campaign?.campaignStatus?.name ?? `ID ${campaign?.campaignStatusId}`;
     const depts    = fmtCampaignDepartments(campaign?.CampaignDepartment);
 
+    const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
+    const votingUrl   = `${frontendUrl}/vote/${id}`;
+    const qrCodeUrl   = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(votingUrl)}`;
+
+    // Record campaign creation on HCS
+    const audit = await recordCrossChainAudit({
+      eventType: 'CAMPAIGN_CREATED',
+      entityId:  `campaign-${id}`,
+      actor:     'agent',
+      payload: {
+        campaignId: id,
+        name,
+        votingStyle: resolvedStyle,
+        startDate:   resolvedStart,
+        endDate:     resolvedEnd,
+        departmentIds: resolvedDeptIds,
+        votingUrl,
+        timestamp: new Date().toISOString(),
+      },
+      tags: ['campaign', `campaign-${id}`, 'creation'],
+    });
+
+    const hcsLine = audit.hcs?.simulated
+      ? `HCS: simulated (set AUDIT_HCS_TOPIC_ID to record on-chain)`
+      : `HCS: tx=${audit.hcs?.tx_hash}  seq#=${audit.hcs?.sequenceNumber}`;
+
     return [
-      `Campaign created successfully!`,
-      `Campaign ID:   ${id}`,
-      `Name:          ${name}`,
-      `Voting Style:  ${resolvedStyle}`,
-      `Status:        ${statusName}`,
-      `Start:         ${resolvedStart}`,
-      `End:           ${resolvedEnd}`,
-      `Image URL:     ${campaign?.url ?? '(none)'}`,
-      `Departments:\n${depts}`,
-      ``,
-      `Next step: call nb_assign_projects with campaignId=${id} and the confirmed project IDs.`,
+      `Campaign created successfully.`,
+      `campaignId: ${id}`,
+      `name: ${name}`,
+      `votingStyle: ${resolvedStyle}`,
+      `status: ${statusName}`,
+      `start: ${resolvedStart}`,
+      `end: ${resolvedEnd}`,
+      `imageUrl: ${campaign?.url ?? '(none)'}`,
+      `departments:\n${depts}`,
+      `votingUrl: ${votingUrl}`,
+      `qrCodeUrl: ${qrCodeUrl}`,
+      `auditId: ${audit.summary.auditId}`,
+      hcsLine,
     ].join('\n');
   }
 }
@@ -338,16 +414,63 @@ class GetCampaignTool extends BaseHederaQueryTool {
 
 // ── nb_assign_projects ────────────────────────────────────────────────────────
 
+// ── nb_search_projects ────────────────────────────────────────────────────────
+
+class SearchNBProjectsTool extends BaseHederaQueryTool {
+  name = 'nb_search_projects';
+  description =
+    'Search the NatureBackers database for projects and return their integer NB Project IDs. ' +
+    'Use this to find the correct integer project IDs BEFORE calling nb_assign_projects. ' +
+    'sp_search_projects only returns Guardian indexer IDs — this tool returns the NB integer IDs needed for campaign assignment. ' +
+    'Optionally filter by a keyword matched against project name or type.';
+  specificInputSchema = z.object({
+    keyword: z.string().optional().describe('Optional keyword to filter by project name or type (case-insensitive).'),
+  });
+  namespace = 'nature-backers-campaign';
+
+  async executeQuery({ keyword }) {
+    this.logger.info(`NB search_projects keyword="${keyword ?? ''}"`);
+    const resp = await axios.get(`${NB_BASE_URL}/project`, { timeout: 15_000 });
+    const raw = resp.data?.data ?? resp.data ?? [];
+
+    let projects = Array.isArray(raw) ? raw : [];
+    if (keyword) {
+      const kw = keyword.toLowerCase();
+      projects = projects.filter(p =>
+        (p.projectName ?? '').toLowerCase().includes(kw) ||
+        (p.projectTypes ?? '').toLowerCase().includes(kw) ||
+        (p.primarySector ?? '').toLowerCase().includes(kw)
+      );
+    }
+
+    if (projects.length === 0) {
+      return keyword
+        ? `No NB projects found matching "${keyword}". Try a broader keyword or omit it to list all projects.`
+        : 'No projects found in the NatureBackers database.';
+    }
+
+    const lines = projects.map(p =>
+      `- NB Project ID: ${p.id}  |  ${p.projectName ?? 'Unnamed'}` +
+      (p.projectTypes ? `  |  Type: ${p.projectTypes}` : '') +
+      (p.status ? `  |  Status: ${p.status}` : '')
+    );
+    return `NatureBackers projects${keyword ? ` matching "${keyword}"` : ''}:\n${lines.join('\n')}`;
+  }
+}
+
+// ── nb_assign_projects ────────────────────────────────────────────────────────
+
 class AssignProjectsTool extends BaseHederaQueryTool {
   name = 'nb_assign_projects';
   description =
-    'Link one or more sustainability projects to an existing campaign. ' +
-    'Call immediately after nb_create_campaign with the NB Project IDs (integers). ' +
+    'Link 1–3 sustainability projects to a campaign. ' +
+    'Call immediately after nb_create_campaign. Pass ALL confirmed project IDs together in one call — ' +
+    'campaigns support multiple projects; voters choose one when they vote. ' +
     'Returns success/failure count and details for each project assignment.';
   specificInputSchema = z.object({
     campaignId:  z.number().int().min(1).describe('Campaign ID to assign projects to.'),
-    projectIds:  z.array(z.union([z.number().int().min(1), z.string()])).min(1)
-                   .describe('Array of NB project IDs (integers). Use "NB Project ID" from sp_search_projects.'),
+    projectIds:  z.array(z.union([z.number().int().min(1), z.string()])).min(1).max(3)
+                   .describe('Array of 1–3 NB project IDs (integers). Include ALL confirmed projects.'),
   });
   namespace = 'nature-backers-campaign';
 
@@ -380,6 +503,51 @@ class AssignProjectsTool extends BaseHederaQueryTool {
       `Assigned ${ok} project(s) to campaign ${campaignId}${failed ? ` (${failed} failed)` : ''}.`,
       ...resultLines,
     ].join('\n');
+  }
+}
+
+// ── nb_cast_vote ──────────────────────────────────────────────────────────────
+
+class CastVoteTool extends BaseHederaQueryTool {
+  name = 'nb_cast_vote';
+  description =
+    'Cast a vote for a project in an active Nature Backers campaign. ' +
+    'The campaign must have status Active (2). ' +
+    'Each user can vote only once per campaign. ' +
+    'Requires the userId of the voter (integer from the NatureBackers user database).';
+  specificInputSchema = z.object({
+    campaignId: z.number().int().min(1).describe('Campaign ID.'),
+    projectId:  z.number().int().min(1).describe('Project ID to vote for (must belong to the campaign).'),
+    userId:     z.number().int().min(1).describe('Voter user ID from NatureBackers database.'),
+    reason:     z.string().optional().describe('Optional reason for the vote (max 500 chars).'),
+  });
+  namespace = 'nature-backers-campaign';
+
+  async executeQuery({ campaignId, projectId, userId, reason }) {
+    this.logger.info(`NB cast_vote campaignId=${campaignId} projectId=${projectId} userId=${userId}`);
+
+    const body = { campaignId, projectId, userId };
+    if (reason) body.reason = reason.slice(0, 500);
+
+    const resp = await axios.post(`${NB_BASE_URL}/vote`, body, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 15_000,
+    });
+
+    const data = resp.data?.data ?? resp.data;
+    const vote = data;
+
+    return [
+      `Vote cast successfully!`,
+      `Vote ID:    ${vote?.id ?? '?'}`,
+      `Campaign:   ${vote?.campaign?.name ?? campaignId}`,
+      `Project:    ${vote?.project?.projectName ?? projectId}`,
+      `Voter:      ${vote?.user?.first_name ?? ''} ${vote?.user?.last_name ?? ''} (ID: ${userId})`,
+      reason ? `Reason:     ${reason}` : null,
+      `Timestamp:  ${vote?.createdAt ?? new Date().toISOString()}`,
+      ``,
+      `The vote has been recorded. It will be pushed to the Hedera blockchain when the campaign is approved.`,
+    ].filter(Boolean).join('\n');
   }
 }
 
@@ -572,6 +740,195 @@ class PushVotesToHederaTool extends BaseHederaQueryTool {
   }
 }
 
+// ── nb_record_campaign_report ─────────────────────────────────────────────────
+
+class RecordCampaignReportTool extends BaseHederaQueryTool {
+  name = 'nb_record_campaign_report';
+  description =
+    'Compile the final campaign results report and record it immutably on Hedera HCS. ' +
+    'Fetches campaign details and vote summary, generates a structured JSON report, ' +
+    'and submits it to HCS for permanent on-chain storage. ' +
+    'Returns the HCS transaction hash and audit ID. ' +
+    'Call after a campaign is Approved or Completed.';
+  specificInputSchema = z.object({
+    campaignId: z.number().int().min(1).describe('Campaign ID to generate a report for.'),
+    userId:     z.number().int().min(1).describe('Admin user ID for vote retrieval authorization.'),
+    note:       z.string().optional().describe('Optional note to include in the report.'),
+  });
+  namespace = 'nature-backers-campaign';
+
+  async executeQuery({ campaignId, userId, note }) {
+    this.logger.info(`NB record_campaign_report campaignId=${campaignId}`);
+
+    const [campResp, votesResp] = await Promise.allSettled([
+      axios.get(`${NB_BASE_URL}/campaign/${campaignId}`, { timeout: 15_000 }),
+      axios.get(`${NB_BASE_URL}/vote/campaign-votes/${campaignId}`, {
+        params: { userId }, timeout: 15_000,
+      }),
+    ]);
+
+    const campaign = campResp.status === 'fulfilled'
+      ? (campResp.value.data?.data ?? campResp.value.data)
+      : null;
+
+    const voteData = votesResp.status === 'fulfilled'
+      ? (votesResp.value.data?.data ?? votesResp.value.data)
+      : null;
+
+    const votes = voteData?.votes ?? [];
+
+    // Tally votes per project
+    const projectTally = {};
+    for (const v of votes) {
+      const key = `${v.projectId}:${v.project?.projectName ?? 'Unknown'}`;
+      projectTally[key] = (projectTally[key] ?? 0) + 1;
+    }
+
+    const topProject = Object.entries(projectTally).sort((a, b) => b[1] - a[1])[0];
+
+    const report = {
+      reportType:    'CAMPAIGN_FINAL_REPORT',
+      campaignId,
+      campaignName:  campaign?.name ?? 'Unknown',
+      status:        campaign?.campaignStatus?.name ?? 'Unknown',
+      startDate:     campaign?.startDate ?? null,
+      endDate:       campaign?.endDate   ?? null,
+      tx_hash:       campaign?.tx_hash   ?? null,
+      totalVotes:    voteData?.totalVotes ?? votes.length,
+      projectTally,
+      winningProject: topProject ? { id: topProject[0].split(':')[0], name: topProject[0].split(':').slice(1).join(':'), votes: topProject[1] } : null,
+      projects:      (campaign?.CampaignProject ?? []).map(cp => ({
+        projectId:   cp.projectId,
+        projectName: cp.project?.projectName ?? 'Unknown',
+        votes:       projectTally[`${cp.projectId}:${cp.project?.projectName ?? 'Unknown'}`] ?? 0,
+      })),
+      generatedAt:   new Date().toISOString(),
+      note:          note ?? null,
+    };
+
+    const result = await recordCrossChainAudit({
+      eventType: 'CAMPAIGN_FINAL_REPORT',
+      entityId:  `campaign-${campaignId}`,
+      actor:     `admin-${userId}`,
+      payload:   report,
+      tags:      [`campaign-${campaignId}`, 'final-report'],
+    });
+
+    const { auditId, hcs, summary } = result;
+
+    return [
+      `Campaign Final Report — Recorded on HCS`,
+      ``,
+      `Campaign:       ${report.campaignName} (ID: ${campaignId})`,
+      `Status:         ${report.status}`,
+      `Total Votes:    ${report.totalVotes}`,
+      report.winningProject
+        ? `Winning Project: ${report.winningProject.name} — ${report.winningProject.votes} vote(s)`
+        : `Winning Project: (no votes yet)`,
+      ``,
+      `Vote Breakdown:`,
+      ...report.projects.map(p => `  - ${p.projectName}: ${p.votes} vote(s)`),
+      ``,
+      `HCS Audit ID:   ${auditId}`,
+      `HCS Status:     ${summary.status}`,
+      hcs.error ? `HCS Error:      ${hcs.error}` : `HCS tx_hash:    ${hcs.tx_hash}${hcs.simulated ? ' (simulated)' : ''}`,
+      `Recorded at:    ${summary.timestamp}`,
+    ].join('\n');
+  }
+}
+
+// ── nb_get_campaign_hcs_report ────────────────────────────────────────────────
+
+class GetCampaignHcsReportTool extends BaseHederaQueryTool {
+  name = 'nb_get_campaign_hcs_report';
+  description =
+    'Retrieve the HCS-recorded final report for a campaign. ' +
+    'Searches the audit log for CAMPAIGN_FINAL_REPORT events for the given campaign. ' +
+    'If AUDIT_TOPIC_ID is configured, also queries the Hedera mirror node for the raw HCS message. ' +
+    'Call nb_record_campaign_report first to create the report if it does not exist yet.';
+  specificInputSchema = z.object({
+    campaignId: z.number().int().min(1).describe('Campaign ID to retrieve the report for.'),
+  });
+  namespace = 'nature-backers-campaign';
+
+  async executeQuery({ campaignId }) {
+    this.logger.info(`NB get_campaign_hcs_report campaignId=${campaignId}`);
+
+    const entries = getAuditLogs({
+      eventType: 'CAMPAIGN_FINAL_REPORT',
+      entityId:  `campaign-${campaignId}`,
+    });
+
+    if (entries.length === 0) {
+      // Try querying the Hedera mirror node if a topic is configured
+      const topicId = process.env.AUDIT_TOPIC_ID;
+      if (topicId) {
+        try {
+          const mirrorResp = await axios.get(
+            `${mirrorNodeBase()}/api/v1/topics/${topicId}/messages`,
+            { params: { limit: 100 }, timeout: 15_000 }
+          );
+          const msgs = mirrorResp.data?.messages ?? [];
+          const matching = msgs.filter(m => {
+            try {
+              const decoded = Buffer.from(m.message, 'base64').toString('utf8');
+              const parsed  = JSON.parse(decoded);
+              return parsed?.payload?.campaignId === campaignId &&
+                     parsed?.eventType === 'CAMPAIGN_FINAL_REPORT';
+            } catch { return false; }
+          });
+
+          if (matching.length > 0) {
+            const lines = matching.map((m, i) => {
+              const decoded = Buffer.from(m.message, 'base64').toString('utf8');
+              const parsed  = JSON.parse(decoded);
+              const p = parsed.payload ?? {};
+              return [
+                `Report ${i + 1}: seq#${m.sequence_number}  ts=${m.consensus_timestamp}`,
+                `  Campaign: ${p.campaignName}  Status: ${p.status}`,
+                `  Total Votes: ${p.totalVotes}`,
+                p.winningProject ? `  Winner: ${p.winningProject.name} (${p.winningProject.votes} votes)` : null,
+                p.note ? `  Note: ${p.note}` : null,
+              ].filter(Boolean).join('\n');
+            });
+            return [
+              `HCS Campaign Report(s) for campaign ${campaignId} — found ${matching.length} on Hedera topic ${topicId}:`,
+              '',
+              ...lines,
+            ].join('\n');
+          }
+        } catch (err) {
+          this.logger.warn(`HCS mirror query failed: ${err.message}`);
+        }
+      }
+      return `No HCS final report found for campaign ${campaignId}. Call nb_record_campaign_report to generate one.`;
+    }
+
+    const lines = entries.map((e, i) => {
+      const p = e.payload ?? {};
+      const hcsLine = e.hcs?.error
+        ? `  HCS: FAILED — ${e.hcs.error}`
+        : `  HCS: ${e.hcs?.tx_hash ?? '?'}${e.hcs?.simulated ? ' (simulated)' : ''}`;
+      return [
+        `Report ${i + 1} — Audit ID: ${e.auditId}`,
+        `  Campaign: ${p.campaignName ?? campaignId}  Status: ${p.status ?? '?'}`,
+        `  Total Votes: ${p.totalVotes ?? '?'}`,
+        p.winningProject ? `  Winner: ${p.winningProject.name} (${p.winningProject.votes} votes)` : null,
+        `  Vote Breakdown: ${Object.entries(p.projectTally ?? {}).map(([k, v]) => `${k.split(':').slice(1).join(':')} (${v})`).join(', ')}`,
+        `  Recorded at: ${e.timestamp}`,
+        hcsLine,
+        p.note ? `  Note: ${p.note}` : null,
+      ].filter(Boolean).join('\n');
+    });
+
+    return [
+      `HCS Campaign Report(s) for campaign ${campaignId} — ${entries.length} report(s) found:`,
+      '',
+      ...lines,
+    ].join('\n');
+  }
+}
+
 // ── nb_get_votes_by_campaign (legacy — full chain decode) ─────────────────────
 
 class GetVotesByCampaignTool extends BaseHederaQueryTool {
@@ -647,9 +1004,9 @@ export class NatureBackersCampaignPlugin extends BasePlugin {
   id      = 'nature-backers-campaign-plugin';
   name    = 'Nature Backers Campaign Plugin';
   description =
-    'Full campaign lifecycle management: create, list, detail, assign projects, ' +
-    'retrieve votes (DB + Hedera), Merkle proof, push to blockchain';
-  version = '2.0.0';
+    'Full campaign lifecycle management: preview, create, list, detail, assign projects, ' +
+    'cast votes, retrieve votes (DB + Hedera), Merkle proof, push to blockchain, HCS reports';
+  version = '3.0.0';
   author  = 'CarbonSustain';
 
   #tools = [];
@@ -658,16 +1015,21 @@ export class NatureBackersCampaignPlugin extends BasePlugin {
     await super.initialize(context);
     const cfg = { hederaKit: context.config.hederaKit, logger: context.logger };
     this.#tools = [
+      new PreviewCampaignTool(cfg),
       new GetCampaignStatusesTool(cfg),
       new GetDepartmentsTool(cfg),
       new CreateCampaignTool(cfg),
       new GetCampaignsTool(cfg),
       new GetCampaignTool(cfg),
+      new SearchNBProjectsTool(cfg),
       new AssignProjectsTool(cfg),
+      new CastVoteTool(cfg),
       new GetCampaignVotesTool(cfg),
       new GetHederaVotesTool(cfg),
       new GetVoteProofTool(cfg),
       new PushVotesToHederaTool(cfg),
+      new RecordCampaignReportTool(cfg),
+      new GetCampaignHcsReportTool(cfg),
       new GetVotesByCampaignTool(cfg),
     ];
   }
