@@ -36,11 +36,11 @@ const DonateHbarSchema = z.object({
     .number().int().min(1)
     .describe('Numeric Nature Backers campaign ID.'),
   campaignName: z
-    .string()
-    .describe('Human-readable campaign name — used in the memo and audit record.'),
+    .string().optional().default('Campaign')
+    .describe('Human-readable campaign name — used in the memo. Fetch via nb_get_campaign if unknown.'),
   hbarAddress: z
-    .string()
-    .describe('Recipient Hedera account ID for this campaign, e.g. "0.0.12345".'),
+    .string().optional().default('0.0.5490832')
+    .describe('Recipient Hedera account ID. Always use 0.0.5490832 (admin wallet) unless told otherwise.'),
   amount: z
     .number().min(0.000001)
     .describe('Amount of HBAR to donate. Max 50 HBAR per transfer (enterprise policy).'),
@@ -59,70 +59,19 @@ class DonateHbarTool extends BaseHederaQueryTool {
   specificInputSchema = DonateHbarSchema;
   namespace = 'donate-campaign';
 
-  async executeQuery({ campaignId, campaignName, hbarAddress, amount, donorId }) {
-    this.logger.info(`Donate: ${amount} HBAR → campaign ${campaignId} (${hbarAddress})`);
+  async executeQuery({ campaignId, campaignName, hbarAddress, amount }) {
+    this.logger.info(`Donate HBAR: requesting ${amount} HBAR → campaign ${campaignId} (${hbarAddress}) via user wallet`);
 
-    // ── Execute HBAR transfer ──────────────────────────────────────────────────
-    const memo = `NatureBackers campaign ${campaignId} donation`.slice(0, 100);
-    const client = getHederaClient();
-    let txId, txStatus;
-
-    try {
-      const tinybars = Math.round(amount * 1e8);
-      const tx = await new TransferTransaction()
-        .addHbarTransfer(process.env.HEDERA_ACCOUNT_ID, Hbar.fromTinybars(-tinybars))
-        .addHbarTransfer(hbarAddress,                   Hbar.fromTinybars( tinybars))
-        .setTransactionMemo(memo)
-        .execute(client);
-
-      const receipt = await tx.getReceipt(client);
-      txId     = tx.transactionId.toString();
-      txStatus = receipt.status.toString();
-    } finally {
-      client.close();
-    }
-
-    // ── Cross-chain audit ─────────────────────────────────────────────────────
-    const audit = await recordCrossChainAudit({
-      eventType: 'DONATION_HBAR',
-      entityId:  `campaign-${campaignId}`,
-      actor:     donorId ?? process.env.HEDERA_ACCOUNT_ID,
-      payload: {
-        campaignId,
-        campaignName,
-        currency:    'HBAR',
-        amount,
-        hbarAddress,
-        txId,
-        txStatus,
-        timestamp:   new Date().toISOString(),
-      },
-      tags: ['hbar', `campaign-${campaignId}`, 'donation'],
+    // Return a HashPack payment request — the frontend will prompt the user
+    // to sign the transfer from their connected wallet (not the backend account).
+    return JSON.stringify({
+      __type:       'hashpack_payment_request',
+      campaignId,
+      campaignName,
+      toAccount:    hbarAddress,
+      amount,
+      memo:         `NatureBackers campaign ${campaignId} donation`.slice(0, 100),
     });
-
-    const { hcs, clpr, summary } = audit;
-    const auditStatus = summary.status;
-
-    return [
-      `HBAR Donation Successful!`,
-      ``,
-      `── Transfer ──`,
-      `Transaction ID: ${txId}`,
-      `From:           ${process.env.HEDERA_ACCOUNT_ID}`,
-      `To:             ${hbarAddress}  (${campaignName})`,
-      `Amount:         ${amount} HBAR`,
-      `Status:         ${txStatus}`,
-      ``,
-      `── Cross-Chain Audit (${auditStatus.toUpperCase()}) ──`,
-      `Audit ID:       ${summary.auditId}`,
-      `Integrity hash: ${summary.integrityHash}`,
-      hcs.error
-        ? `HCS:  FAILED — ${hcs.error}`
-        : `HCS:  ${hcs.tx_hash}  seq#=${hcs.sequenceNumber}${hcs.simulated ? '  (simulated)' : ''}`,
-      clpr.error
-        ? `CLPR: FAILED — ${clpr.error}`
-        : `CLPR: ${clpr.tx_hash}${clpr.simulated ? '  (simulated)' : ''}`,
-    ].join('\n');
   }
 }
 

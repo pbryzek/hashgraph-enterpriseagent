@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import AgentChat from './components/AgentChat.jsx';
 import VotePage from './components/VotePage.jsx';
+import HashPackDonate from './components/HashPackDonate.jsx';
 import './App.css';
 
 const COINGECKO_URL =
@@ -74,6 +75,7 @@ export default function App() {
           <p>Nature-Based Solutions Agent — powered by NatureBackers</p>
         </div>
         <HbarTicker />
+        <HashPackDonate />
       </header>
       <AgentChat />
     </div>

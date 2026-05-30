@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, Component } from 'react';
 import ReactMarkdown from 'react-markdown';
+import { useHashPack } from '../hooks/HashPackContext.jsx';
 import './AgentChat.css';
 
 const HASHSCAN_BASE = 'https://hashscan.io/testnet/transaction';
@@ -136,6 +137,93 @@ function ApprovalCard({ preview, onApprove, onCancel }) {
   );
 }
 
+// ── HashPack payment card ─────────────────────────────────────────────────────
+function HashPackPaymentCard({ payment, onDone }) {
+  const { accountId, sendHbar, connect, ready, error: walletError } = useHashPack();
+  const [signing, setSigning]   = useState(false);
+  const [txId, setTxId]         = useState(null);
+  const [err, setErr]           = useState(null);
+  const network = import.meta.env.VITE_HEDERA_NETWORK || 'testnet';
+  console.log('[PaymentCard] accountId:', accountId, 'ready:', ready, 'walletError:', walletError);
+
+  async function handleSign() {
+    setSigning(true);
+    setErr(null);
+    try {
+      const result = await sendHbar(payment.amount, payment.toAccount);
+      const id = result?.transactionId?.toString() ?? 'sent';
+      setTxId(id);
+      onDone?.({ txId: id, amount: payment.amount, toAccount: payment.toAccount });
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setSigning(false);
+    }
+  }
+
+  return (
+    <div className="approval-card">
+      <div className="approval-card__header">
+        <span className="approval-card__icon">💚</span>
+        <span className="approval-card__title">HBAR Donation — Sign with HashPack</span>
+      </div>
+      <div className="approval-card__body">
+        <div className="approval-row">
+          <span className="approval-label">Campaign</span>
+          <span className="approval-value">{payment.campaignName}</span>
+        </div>
+        <div className="approval-row">
+          <span className="approval-label">Amount</span>
+          <span className="approval-value">{payment.amount} HBAR</span>
+        </div>
+        <div className="approval-row">
+          <span className="approval-label">To</span>
+          <span className="approval-value" style={{ fontFamily: 'monospace', fontSize: '0.82rem' }}>{payment.toAccount}</span>
+        </div>
+        {accountId && (
+          <div className="approval-row">
+            <span className="approval-label">From</span>
+            <span className="approval-value" style={{ fontFamily: 'monospace', fontSize: '0.82rem' }}>{accountId}</span>
+          </div>
+        )}
+      </div>
+
+      {txId ? (
+        <div style={{ padding: '12px 16px', color: '#16a34a', fontSize: '0.85rem' }}>
+          ✅ Sent! &nbsp;
+          <a href={`https://hashscan.io/${network}/transaction/${txId.replace('@','-')}`}
+             target="_blank" rel="noreferrer" style={{ color: '#7c3aed' }}>
+            View on Hashscan ↗
+          </a>
+        </div>
+      ) : (
+        <div className="approval-card__actions">
+          {walletError && (
+            <p style={{ color: '#ef4444', fontSize: '0.75rem', marginBottom: 8 }}>Wallet error: {walletError}</p>
+          )}
+          {!accountId ? (
+            <button className="approval-btn approval-btn--approve" onClick={connect} disabled={!ready}>
+              {!ready ? 'Initializing wallet…' : '🔗 Connect HashPack to sign'}
+            </button>
+          ) : (
+            <>
+              <button className="approval-btn approval-btn--approve" onClick={handleSign} disabled={signing}>
+                {signing ? 'Waiting for HashPack…' : `Sign & Send ${payment.amount} HBAR`}
+              </button>
+              {signing && (
+                <p style={{ fontSize: '0.73rem', color: '#6b7280', margin: '6px 0 0' }}>
+                  No popup? Open HashPack → click the <strong>DAPPS</strong> tab → approve the pending request.
+                </p>
+              )}
+            </>
+          )}
+          {err && <p style={{ color: '#ef4444', fontSize: '0.78rem', margin: '8px 0 0' }}>❌ {err}</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main chat component ───────────────────────────────────────────────────────
 export default function AgentChat() {
   const [messages, setMessages]           = useState([]);
@@ -145,11 +233,12 @@ export default function AgentChat() {
   const [phase, setPhase]                 = useState('research');
   const [showTransition, setShowTransition] = useState(false);
   const [pendingApproval, setPendingApproval] = useState(null);
+  const [pendingPayment, setPendingPayment]   = useState(null);
   const bottomRef = useRef(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, steps, pendingApproval]);
+  }, [messages, steps, pendingApproval, pendingPayment]);
 
   async function sendMessage(text = input) {
     const trimmed = text.trim();
@@ -160,6 +249,7 @@ export default function AgentChat() {
     setSteps([]);
     setShowTransition(false);
     setPendingApproval(null);
+    // Don't clear pendingPayment here — keep the signing card visible across turns
 
     const userMsg = { role: 'user', content: trimmed };
     setMessages((prev) => [...prev, userMsg]);
@@ -222,6 +312,11 @@ export default function AgentChat() {
       case 'approval_request':
         if (event.campaignPreview) {
           setPendingApproval(event.campaignPreview);
+        }
+        break;
+      case 'hashpack_payment':
+        if (event.payment) {
+          setPendingPayment(event.payment);
         }
         break;
       case 'done': {
@@ -334,6 +429,20 @@ export default function AgentChat() {
             preview={pendingApproval}
             onApprove={handleApprove}
             onCancel={handleCancelApproval}
+          />
+        )}
+
+        {pendingPayment && (
+          <HashPackPaymentCard
+            payment={pendingPayment}
+            onDone={({ txId, amount, toAccount }) => {
+              setMessages(prev => [...prev, {
+                role: 'assistant',
+                content: `✅ Sent ${amount} HBAR to ${toAccount}. [View on Hashscan](https://hashscan.io/${import.meta.env.VITE_HEDERA_NETWORK || 'testnet'}/transaction/${txId.replace('@','-')})`,
+                txIds: [],
+              }]);
+              setPendingPayment(null);
+            }}
           />
         )}
 

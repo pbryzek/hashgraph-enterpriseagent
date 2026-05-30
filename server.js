@@ -27,6 +27,15 @@ let campaignExecutor;
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+// ── Public config (non-sensitive) — used by frontend for wallet integration ───
+
+app.get('/api/config', (_req, res) => {
+  res.json({
+    adminAccountId: process.env.HEDERA_ACCOUNT_ID ?? null,
+    network: (process.env.HEDERA_NETWORK || 'testnet').toLowerCase(),
+  });
+});
+
 // ── Campaign detail proxy (used by VotePage) ──────────────────────────────────
 
 app.get('/api/campaigns/:id', async (req, res) => {
@@ -123,8 +132,9 @@ app.post('/api/agent', async (req, res) => {
 
   const txIds = [];
   const toolOutputs = [];
-  let currentToolName = null;
-  let pendingApproval = null; // set when nb_preview_campaign runs
+  let currentToolName  = null;
+  let pendingApproval  = null;
+  let pendingPayment   = null; // set when donate_hbar_to_campaign runs
 
   try {
     send({ type: 'status', step: 'Agent started…' });
@@ -165,6 +175,17 @@ app.post('/api/agent', async (req, res) => {
                     }
                   } catch { /* not JSON, ignore */ }
                 }
+
+                // Detect HashPack payment request — check rawOutput directly
+                if (rawOutput && typeof rawOutput === 'string' && rawOutput.includes('hashpack_payment_request')) {
+                  try {
+                    const payment = JSON.parse(rawOutput);
+                    if (payment?.__type === 'hashpack_payment_request') {
+                      pendingPayment = payment;
+                      send({ type: 'hashpack_payment', payment });
+                    }
+                  } catch { /* not JSON */ }
+                }
               } catch {
                 toolOutputs.push(rawOutput);
               }
@@ -191,6 +212,16 @@ app.post('/api/agent', async (req, res) => {
 
     if (!output && toolOutputs.length > 0) {
       output = toolOutputs.join('\n\n---\n\n');
+    }
+
+    // If a HashPack payment is pending, always replace the output entirely
+    if (pendingPayment) {
+      output = `Please sign the **${pendingPayment.amount} HBAR** donation to **${pendingPayment.campaignName}** using your connected HashPack wallet.`;
+    }
+
+    // If a campaign preview is pending, always replace the output entirely
+    if (pendingApproval) {
+      output = `Here is the campaign preview for **${pendingApproval.name}**. Please review the details and click **Approve** to create it, or let me know if you'd like to change anything.`;
     }
 
     send({

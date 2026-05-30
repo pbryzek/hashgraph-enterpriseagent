@@ -14,8 +14,9 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@hashgraph/hashconnect": "^1.24.0",
     "@hashgraph/proto": "^2.25.0",
-    "@hashgraph/sdk": "^2.72.0",
+    "@hashgraph/sdk": "^2.81.0",
     "@hashgraphonline/standards-agent-kit": "^0.2.166",
     "@langchain/anthropic": "^0.3.0",
     "@langchain/core": "^0.3.0",
