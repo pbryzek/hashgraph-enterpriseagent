@@ -4,6 +4,7 @@ const API_BASE      = import.meta.env.VITE_API_URL || '';
 const ENV_ADMIN     = import.meta.env.VITE_ADMIN_ACCOUNT_ID || null;
 const ENV_NETWORK   = import.meta.env.VITE_HEDERA_NETWORK   || 'testnet';
 const WC_PROJECT_ID = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID || '';
+export const USDC_TOKEN_ID = import.meta.env.VITE_USDC_TOKEN_ID || '0.0.456858'; // Testnet USDC
 
 const APP_METADATA = {
   name:        'CarbonSustain',
@@ -81,7 +82,8 @@ export function HashPackProvider({ children }) {
     setAccountId(null);
   }, []);
 
-  const sendHbar = useCallback(async (amountHbar, toAccountOverride) => {
+  const sendHbar = useCallback(async (amountHbar, toAccountOverride, onTxId) => {
+    console.log("[HashPackContext] sendHbar called:", { amountHbar, toAccountOverride });
     if (!connectorRef.current || !accountId) throw new Error('Wallet not connected');
     const recipient = toAccountOverride ?? adminAccountId;
     if (!recipient) throw new Error('Recipient account not configured');
@@ -90,18 +92,67 @@ export function HashPackProvider({ children }) {
 
     const fromId = AccountId.fromString(accountId);
     const toId   = AccountId.fromString(recipient);
-    const signer = connectorRef.current.getSigner(fromId);
 
-    const tx = await new TransferTransaction()
+    const signers = connectorRef.current.signers;
+    if (!signers || signers.length === 0) {
+      throw new Error('No active signer — wallet may need to reconnect');
+    }
+
+    const signer = signers.find(s => s.getAccountId().toString() === accountId);
+    if (!signer) throw new Error(`No signer found for account ${accountId}`);
+
+    console.log("[HashPackContext] Preparing transaction...");
+
+    const tx = new TransferTransaction()
       .addHbarTransfer(fromId, new Hbar(-amountHbar))
       .addHbarTransfer(toId,   new Hbar(amountHbar))
-      .freezeWithSigner(signer);
+      .setTransactionMemo(`NatureBackers donation: ${amountHbar} HBAR`)
+      .setMaxTransactionFee(new Hbar(1));
 
-    return tx.executeWithSigner(signer);
+    // HashPack's WalletConnect signer handles freeze/sign/execute as one atomic
+    // RPC call — it doesn't expose node IDs client-side, so freezeWithSigner
+    // fails. We get the real txId from the response after execute instead.
+    console.log("[HashPackContext] Calling tx.executeWithSigner(signer)...");
+    const response = await tx.executeWithSigner(signer);
+    console.log("[HashPackContext] Transaction response received:", response);
+    return response;
+  }, [accountId, adminAccountId]);
+
+  // USDC (HTS token) transfer — 6 decimal places (1 USDC = 1_000_000 tinycents)
+  const sendUsdc = useCallback(async (amountUsdc, toAccountOverride) => {
+    console.log("[HashPackContext] sendUsdc called:", { amountUsdc, toAccountOverride });
+    if (!connectorRef.current || !accountId) throw new Error('Wallet not connected');
+    const recipient = toAccountOverride ?? adminAccountId;
+    if (!recipient) throw new Error('Recipient account not configured');
+
+    const { TransferTransaction, Hbar, AccountId, TokenId } = await import('@hashgraph/sdk');
+
+    const fromId    = AccountId.fromString(accountId);
+    const toId      = AccountId.fromString(recipient);
+    const tokenId   = TokenId.fromString(USDC_TOKEN_ID);
+    const tinycents = Math.round(amountUsdc * 1_000_000);
+
+    const signers = connectorRef.current.signers;
+    if (!signers || signers.length === 0) throw new Error('No active signer — wallet may need to reconnect');
+    const signer = signers.find(s => s.getAccountId().toString() === accountId);
+    if (!signer) throw new Error(`No signer found for account ${accountId}`);
+
+    console.log("[HashPackContext] Preparing USDC token transfer...");
+
+    const tx = new TransferTransaction()
+      .addTokenTransfer(tokenId, fromId, -tinycents)
+      .addTokenTransfer(tokenId, toId,    tinycents)
+      .setTransactionMemo(`NatureBackers USDC donation: ${amountUsdc} USDC`)
+      .setMaxTransactionFee(new Hbar(2));
+
+    console.log("[HashPackContext] Calling tx.executeWithSigner(signer) for USDC...");
+    const response = await tx.executeWithSigner(signer);
+    console.log("[HashPackContext] USDC transaction response received:", response);
+    return response;
   }, [accountId, adminAccountId]);
 
   return (
-    <HashPackContext.Provider value={{ accountId, adminAccountId, ready, isConnecting, error, connect, disconnect, sendHbar }}>
+    <HashPackContext.Provider value={{ accountId, adminAccountId, ready, isConnecting, error, connect, disconnect, sendHbar, sendUsdc }}>
       {children}
     </HashPackContext.Provider>
   );

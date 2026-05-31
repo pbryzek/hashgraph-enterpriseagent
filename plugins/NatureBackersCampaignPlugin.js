@@ -33,9 +33,23 @@ import axios from 'axios';
 import { z } from 'zod';
 import { BasePlugin, BaseHederaQueryTool } from 'hedera-agent-kit';
 import FormData from 'form-data';
+import { createWriteStream } from 'fs';
+import { mkdir } from 'fs/promises';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 import { recordCrossChainAudit, getAuditLogs } from './crossChainAudit.js';
+import PDFDocument from 'pdfkit';
 
-const NB_BASE_URL = 'https://d3chyxfaxhbtc9.cloudfront.net';
+const __pluginDir = dirname(fileURLToPath(import.meta.url));
+const TMP_DIR = join(__pluginDir, '..', 'tmp');
+
+const NB_BASE_URL      = 'https://d3chyxfaxhbtc9.cloudfront.net';
+const MAINNET_INDEXER  = 'https://indexer.guardianservice.app/api/v1/mainnet';
+
+function indexerLink(consensusTimestamp) {
+  if (!consensusTimestamp) return null;
+  return `/indexer/${encodeURIComponent(consensusTimestamp)}`;
+}
 
 // ── Hedera mirror node helpers ─────────────────────────────────────────────────
 
@@ -85,7 +99,8 @@ function decodeVoteParams(functionParams) {
 function fmtCampaignProjects(campaignProjects) {
   if (!Array.isArray(campaignProjects) || campaignProjects.length === 0) return '    (none)';
   return campaignProjects.map(cp => {
-    const p = cp.project ?? {};
+    const p   = cp.project ?? {};
+    const url = indexerLink(p.consensusTimestamp);
     return [
       `    - CampaignProject ID: ${cp.id}  Project ID: ${cp.projectId}`,
       p.projectName ? `      Name:        ${p.projectName}` : null,
@@ -93,7 +108,7 @@ function fmtCampaignProjects(campaignProjects) {
       p.projectMethodology ? `      Methodology: ${p.projectMethodology}` : null,
       p.standards?.carbonStandard ? `      Standard:    ${p.standards.carbonStandard}` : null,
       p.status ? `      Status:      ${p.status}` : null,
-      p.consensusTimestamp ? `      Timestamp:   ${p.consensusTimestamp}` : null,
+      url ? `      🔗 Indexer: [Verify on Guardian Mainnet](${url})` : null,
     ].filter(Boolean).join('\n');
   }).join('\n');
 }
@@ -140,6 +155,119 @@ function defaultEndDate(startIso) {
   const d = new Date(startIso);
   d.setHours(d.getHours() + 1);
   return d.toISOString();
+}
+
+// ── gatherCampaignRecords ─────────────────────────────────────────────────────
+// Merges in-memory audit log + Hedera mirror node records for a campaign.
+// Returns a normalised array: { source, auditId, eventType, entityId, actor,
+//   tags, payload, timestamp, hcsSeq?, hcsTx? }
+// Mirror node is authoritative; in-memory fills gaps (propagation lag / simulated HCS).
+
+async function gatherCampaignRecords(campaignId, limit = 100, mirrorTimeoutMs = 20_000) {
+  const topicId = process.env.AUDIT_HCS_TOPIC_ID || process.env.AUDIT_TOPIC_ID;
+
+  // ── 1. In-memory ─────────────────────────────────────────────────────────────
+  const allMem = getAuditLogs({});
+  const memEntries = allMem.filter(e =>
+    e.entityId === `campaign-${campaignId}` ||
+    (e.tags ?? []).includes(`campaign-${campaignId}`)
+  ).map(e => ({
+    source:    'memory',
+    auditId:   e.auditId,
+    eventType: e.eventType,
+    entityId:  e.entityId,
+    actor:     e.actor,
+    tags:      e.tags ?? [],
+    payload:   e.payload ?? {},
+    timestamp: e.timestamp,
+  }));
+
+  // ── 2. Mirror node ────────────────────────────────────────────────────────────
+  let mirrorEntries = [];
+  if (topicId) {
+    try {
+      const resp = await axios.get(
+        `${mirrorNodeBase()}/api/v1/topics/${topicId}/messages`,
+        { params: { limit }, timeout: mirrorTimeoutMs }
+      );
+      const msgs = resp.data?.messages ?? [];
+      mirrorEntries = msgs.map(m => {
+        try {
+          const parsed = JSON.parse(Buffer.from(m.message, 'base64').toString('utf8'));
+          const campaignMatch =
+            parsed.entityId === `campaign-${campaignId}` ||
+            parsed.payload?.campaignId === campaignId ||
+            (parsed.tags ?? []).includes(`campaign-${campaignId}`);
+          if (!campaignMatch) return null;
+          return {
+            source:    'mirror',
+            auditId:   parsed.auditId,
+            eventType: parsed.eventType,
+            entityId:  parsed.entityId,
+            actor:     parsed.actor,
+            tags:      parsed.tags ?? [],
+            payload:   parsed.payload ?? {},
+            timestamp: parsed.timestamp ?? m.consensus_timestamp,
+            hcsSeq:    m.sequence_number,
+            hcsTx:     m.consensus_timestamp,
+          };
+        } catch { return null; }
+      }).filter(Boolean);
+    } catch { /* mirror unavailable — use in-memory only */ }
+  }
+
+  // ── 3. Deduplicate — mirror wins on auditId collision ────────────────────────
+  const mirrorAuditIds = new Set(mirrorEntries.map(r => r.auditId).filter(Boolean));
+  const memOnly = memEntries.filter(e => !mirrorAuditIds.has(e.auditId));
+
+  return [...mirrorEntries, ...memOnly];
+}
+
+// ── fetchVotesForCampaign ─────────────────────────────────────────────────────
+// Centralised vote resolver used by RecordCampaignReportTool and
+// GetCampaignHcsReportTool.  Strategy:
+//   1. Use provided userId, or fall back to NB_ADMIN_USER_ID env var (default 1)
+//   2. If both /vote/campaign-votes and /vote/hedera return 0 votes,
+//      fall back to campaign.votes embedded in the campaign object (populated
+//      when the campaign is fetched from /campaign/:id)
+// This handles the common case where the caller omits userId but votes exist.
+
+async function fetchVotesForCampaign(campaignId, userId, campaign) {
+  const effectiveUserId = userId ?? Number(process.env.NB_ADMIN_USER_ID ?? 1);
+  const voteParams = { userId: effectiveUserId };
+
+  const [dbVotesResp, hederaVotesResp, proofResp] = await Promise.allSettled([
+    axios.get(`${NB_BASE_URL}/vote/campaign-votes/${campaignId}`, { params: voteParams, timeout: 15_000 }),
+    axios.get(`${NB_BASE_URL}/vote/hedera/${campaignId}`,         { params: voteParams, timeout: 20_000 }),
+    axios.get(`${NB_BASE_URL}/vote/proof/${campaignId}`,          { params: voteParams, timeout: 20_000 }),
+  ]);
+
+  const dbVoteData     = dbVotesResp.status     === 'fulfilled' ? (dbVotesResp.value.data?.data     ?? dbVotesResp.value.data)     : null;
+  const hederaVoteData = hederaVotesResp.status === 'fulfilled' ? (hederaVotesResp.value.data?.data ?? hederaVotesResp.value.data) : null;
+  const proofData      = proofResp.status       === 'fulfilled' ? (proofResp.value.data?.data       ?? proofResp.value.data)       : null;
+
+  let dbVotes     = dbVoteData?.votes     ?? [];
+  let hederaVotes = hederaVoteData?.votes ?? [];
+  const merkleRoot  = proofData?.merkleRoot ?? null;
+  const merkleVotes = proofData?.votes      ?? [];
+
+  // Fallback: use votes embedded in the campaign object when the dedicated
+  // endpoints returned nothing (e.g. auth failure without userId).
+  // Build a projectId → projectName map from CampaignProject for name lookup.
+  if (dbVotes.length === 0 && hederaVotes.length === 0 && Array.isArray(campaign?.votes) && campaign.votes.length > 0) {
+    const projNameMap = Object.fromEntries(
+      (campaign.CampaignProject ?? []).map(cp => [
+        cp.projectId,
+        cp.project?.projectName ?? `Project ${cp.projectId}`,
+      ])
+    );
+    dbVotes = campaign.votes.map(v => ({
+      ...v,
+      project: v.project ?? { projectName: projNameMap[v.projectId] ?? `Project ${v.projectId}` },
+    }));
+  }
+
+  return { dbVotes, hederaVotes, merkleRoot, merkleVotes };
 }
 
 // ── Shared campaign schema ─────────────────────────────────────────────────────
@@ -426,7 +554,9 @@ class SearchNBProjectsTool extends BaseHederaQueryTool {
   name = 'nb_search_projects';
   description =
     'PRIMARY tool for finding projects to feature in a campaign. ' +
-    'Searches the NatureBackers platform database — this has richer coverage than the Guardian indexer for campaign assignment. ' +
+    'Searches the NatureBackers platform database. ' +
+    'PRIORITY: Guardian-indexed (on-chain verified) projects are always returned first. ' +
+    'Unverified backend-only projects are only returned as a fallback when no indexed projects match. ' +
     'Returns NB integer project IDs (required by nb_assign_projects), full names, types, SDGs, location, and methodology. ' +
     'Use keyword to filter: e.g. "wetland", "coastal", "reforestation", "watershed", "bay area", "mangrove", "solar", "biochar". ' +
     'Omit keyword to list ALL available projects. ' +
@@ -473,28 +603,53 @@ class SearchNBProjectsTool extends BaseHederaQueryTool {
       return `No NB projects found matching "${hint}". Try a broader keyword (e.g. "coastal", "restoration", "water") or omit it to list all projects.`;
     }
 
-    const indexerBase = (process.env.NATURE_BACKERS_API_URL ?? 'https://indexer.guardianservice.app/api/v1/mainnet')
-      .replace(/\/$/, '');
+    // Prioritise Guardian-indexed (live) projects; only fall back to unverified
+    // backend-only projects when no live ones match the query.
+    const liveProjects      = projects.filter(p => !!p.consensusTimestamp);
+    const hardcodedProjects = projects.filter(p => !p.consensusTimestamp);
 
-    const lines = projects.map(p => {
+    let projectsToShow;
+    let fallbackNote = null;
+
+    if (liveProjects.length > 0) {
+      projectsToShow = liveProjects;
+    } else {
+      projectsToShow = hardcodedProjects;
+      const query = keyword ? `"${keyword}"` : sdg ? `SDG ${sdg}` : 'this query';
+      fallbackNote =
+        `⚠️ No Guardian-indexed (on-chain verified) projects match ${query}. ` +
+        `Showing ${hardcodedProjects.length} unverified project(s) from the NatureBackers database. ` +
+        `These are not yet registered on the Guardian mainnet indexer.`;
+    }
+
+    const formatProject = (p) => {
       const sdgLabels = (p.sdgs ?? []).map(s => `SDG ${s.sdgId} - ${s.sdg?.name ?? ''}`).join(', ');
-      const location = [p.latitude != null ? `${p.latitude.toFixed(2)}°N` : null, p.longitude != null ? `${p.longitude.toFixed(2)}°E` : null].filter(Boolean).join(', ');
-      const indexerUrl = p.consensusTimestamp
-        ? `${indexerBase}/entities/vc-documents/${encodeURIComponent(p.consensusTimestamp)}`
-        : null;
+      const location  = [
+        p.latitude  != null ? `${p.latitude.toFixed(2)}°N`  : null,
+        p.longitude != null ? `${p.longitude.toFixed(2)}°E` : null,
+      ].filter(Boolean).join(', ');
+      const url = indexerLink(p.consensusTimestamp);
       return [
         `NB Project ID: ${p.id}  |  ${p.projectName ?? 'Unnamed'}`,
         `  Type: ${p.projectTypes ?? 'N/A'}`,
-        p.primarySector ? `  Sector: ${p.primarySector}` : null,
-        p.projectMethodology ? `  Methodology: ${p.projectMethodology}` : null,
-        sdgLabels ? `  SDGs: ${sdgLabels}` : null,
-        location ? `  Location: ${location}` : null,
-        `  Status: ${p.status ?? 'N/A'}`,
-        indexerUrl ? `  Indexer: ${indexerUrl}` : `  Indexer: (not on Guardian indexer)`,
+        p.primarySector      ? `  Sector:      ${p.primarySector}`       : null,
+        p.projectMethodology ? `  Methodology: ${p.projectMethodology}`  : null,
+        sdgLabels            ? `  SDGs:        ${sdgLabels}`             : null,
+        location             ? `  Location:    ${location}`              : null,
+        `  Status:      ${p.status ?? 'N/A'}`,
+        url
+          ? `  🔗 Indexer: [Verify on Guardian Mainnet](${url})`
+          : `  🔗 Indexer: not registered on Guardian mainnet indexer`,
       ].filter(Boolean).join('\n');
-    });
+    };
 
-    return `NatureBackers projects${keyword ? ` matching "${keyword}"` : sdg ? ` with SDG ${sdg}` : ' (all)'}:\n\n${lines.join('\n\n')}`;
+    const lines = projectsToShow.map(formatProject);
+    const header = `NatureBackers projects${keyword ? ` matching "${keyword}"` : sdg ? ` with SDG ${sdg}` : ' (all)'}` +
+      ` — ${projectsToShow.length} Guardian-indexed project(s)` +
+      (liveProjects.length === 0 && hardcodedProjects.length > 0 ? ` (unverified fallback)` : '') +
+      `:`;
+
+    return [fallbackNote, `${header}\n\n${lines.join('\n\n')}`].filter(Boolean).join('\n\n');
   }
 }
 
@@ -754,18 +909,9 @@ class RecordCampaignReportTool extends BaseHederaQueryTool {
   async executeQuery({ campaignId, userId, note }) {
     this.logger.info(`NB record_campaign_report campaignId=${campaignId} userId=${userId ?? 'none'}`);
 
-    // Fetch campaign, DB votes, Hedera on-chain votes, and Merkle proof in parallel
-    const voteParams = userId != null ? { userId } : {};
-    const [campResp, dbVotesResp, hederaVotesResp, proofResp] = await Promise.allSettled([
-      axios.get(`${NB_BASE_URL}/campaign/${campaignId}`, { timeout: 15_000 }),
-      axios.get(`${NB_BASE_URL}/vote/campaign-votes/${campaignId}`, { params: voteParams, timeout: 15_000 }),
-      axios.get(`${NB_BASE_URL}/vote/hedera/${campaignId}`, { params: voteParams, timeout: 20_000 }),
-      axios.get(`${NB_BASE_URL}/vote/proof/${campaignId}`,  { params: voteParams, timeout: 20_000 }),
-    ]);
-
-    const campaign = campResp.status === 'fulfilled'
-      ? (campResp.value.data?.data ?? campResp.value.data)
-      : null;
+    // Fetch campaign first (needed for status check + vote fallback)
+    const campResp = await axios.get(`${NB_BASE_URL}/campaign/${campaignId}`, { timeout: 15_000 });
+    const campaign = campResp.data?.data ?? campResp.data;
 
     // Enforce Approved status before writing the HCS report
     const statusId = campaign?.campaignStatusId;
@@ -783,24 +929,11 @@ class RecordCampaignReportTool extends BaseHederaQueryTool {
       ].join('\n');
     }
 
-    // DB votes — primary source (always available, no on-chain push required)
-    const dbVoteData = dbVotesResp.status === 'fulfilled'
-      ? (dbVotesResp.value.data?.data ?? dbVotesResp.value.data)
-      : null;
-    const dbVotes = dbVoteData?.votes ?? [];
+    // Fetch votes with fallback logic (userId fallback + campaign.votes fallback)
+    const { dbVotes, hederaVotes, merkleRoot, merkleVotes } =
+      await fetchVotesForCampaign(campaignId, userId, campaign);
 
-    // On-chain Hedera votes — for vote hashes and Merkle proof
-    const hederaVoteData = hederaVotesResp.status === 'fulfilled'
-      ? (hederaVotesResp.value.data?.data ?? hederaVotesResp.value.data)
-      : null;
-    const hederaVotes = hederaVoteData?.votes ?? [];
-
-    // Merkle proof
-    const proofData = proofResp.status === 'fulfilled'
-      ? (proofResp.value.data?.data ?? proofResp.value.data)
-      : null;
-    const merkleRoot  = proofData?.merkleRoot ?? null;
-    const merkleVotes = proofData?.votes      ?? [];
+    this.logger.info(`NB record_campaign_report votes: db=${dbVotes.length} hedera=${hederaVotes.length} merkle=${merkleVotes.length}`);
 
     // Use DB votes as primary tally — fall back to Hedera votes if DB returned nothing
     const votesForTally = dbVotes.length > 0 ? dbVotes : hederaVotes;
@@ -990,26 +1123,11 @@ class GetCampaignHcsReportTool extends BaseHederaQueryTool {
 
     // Campaign is Approved — auto-generate the HCS final report
     this.logger.info(`NB get_campaign_hcs_report: campaign ${campaignId} is Approved — auto-generating HCS report`);
-    const voteParams = userId != null ? { userId } : {};
 
-    const [dbVotesResp, hederaVotesResp, proofResp] = await Promise.allSettled([
-      axios.get(`${NB_BASE_URL}/vote/campaign-votes/${campaignId}`, { params: voteParams, timeout: 15_000 }),
-      axios.get(`${NB_BASE_URL}/vote/hedera/${campaignId}`, { params: voteParams, timeout: 20_000 }),
-      axios.get(`${NB_BASE_URL}/vote/proof/${campaignId}`,  { params: voteParams, timeout: 20_000 }),
-    ]);
+    const { dbVotes, hederaVotes, merkleRoot, merkleVotes } =
+      await fetchVotesForCampaign(campaignId, userId, campaign);
 
-    const dbVoteData = dbVotesResp.status === 'fulfilled'
-      ? (dbVotesResp.value.data?.data ?? dbVotesResp.value.data) : null;
-    const dbVotes = dbVoteData?.votes ?? [];
-
-    const hederaVoteData = hederaVotesResp.status === 'fulfilled'
-      ? (hederaVotesResp.value.data?.data ?? hederaVotesResp.value.data) : null;
-    const hederaVotes = hederaVoteData?.votes ?? [];
-
-    const proofData = proofResp.status === 'fulfilled'
-      ? (proofResp.value.data?.data ?? proofResp.value.data) : null;
-    const merkleRoot  = proofData?.merkleRoot ?? null;
-    const merkleVotes = proofData?.votes      ?? [];
+    this.logger.info(`NB get_campaign_hcs_report votes: db=${dbVotes.length} hedera=${hederaVotes.length} merkle=${merkleVotes.length}`);
 
     const votesForTally = dbVotes.length > 0 ? dbVotes : hederaVotes;
 
@@ -1191,13 +1309,13 @@ class GetVotesByCampaignTool extends BaseHederaQueryTool {
 class GetHcsRecordsTool extends BaseHederaQueryTool {
   name = 'nb_get_hcs_records';
   description =
-    'Retrieve HCS audit records directly from the Hedera mirror node. ' +
-    'Returns all messages on the audit topic, optionally filtered by campaignId. ' +
-    'Use this when nb_get_campaign_hcs_report returns nothing — the in-memory log resets on restart ' +
-    'but the Hedera mirror node is permanent. Requires AUDIT_HCS_TOPIC_ID or AUDIT_TOPIC_ID env var.';
+    'Retrieve ALL HCS audit records for a campaign: campaign creation, final report, AND donation ' +
+    'payments (HBAR intent + CLPR). Merges Hedera mirror node records with the in-memory audit log ' +
+    'so nothing is missed even if HCS propagation is delayed. Use this when the user asks for ' +
+    '"HCS logs", "full audit trail", or any on-chain record query for a campaign.';
   specificInputSchema = z.object({
     campaignId: z.number().int().min(1).optional()
-      .describe('Filter results to a specific campaign ID. Omit to return ALL HCS records on the topic.'),
+      .describe('Filter to a specific campaign ID. Omit to return ALL HCS records across all campaigns.'),
     limit: z.number().int().min(1).max(100).optional()
       .describe('Max messages to fetch from the mirror node (default 100).'),
   });
@@ -1205,84 +1323,347 @@ class GetHcsRecordsTool extends BaseHederaQueryTool {
 
   async executeQuery({ campaignId, limit = 100 }) {
     const topicId = process.env.AUDIT_HCS_TOPIC_ID || process.env.AUDIT_TOPIC_ID;
-    if (!topicId) {
-      return 'No HCS topic configured. Set AUDIT_HCS_TOPIC_ID or AUDIT_TOPIC_ID in the environment.';
+    this.logger.info(`NB get_hcs_records${topicId ? ` topic=${topicId}` : ' (no topic)'} campaignId=${campaignId ?? 'all'}`);
+
+    // ── In-memory records ─────────────────────────────────────────────────────
+    const allMem = getAuditLogs({});
+    const memEntries = campaignId != null
+      ? allMem.filter(e =>
+          e.entityId === `campaign-${campaignId}` ||
+          (e.tags ?? []).includes(`campaign-${campaignId}`)
+        )
+      : allMem;
+
+    // ── Mirror node records ───────────────────────────────────────────────────
+    let mirrorRecords = [];
+    if (topicId) {
+      try {
+        const mirrorResp = await axios.get(
+          `${mirrorNodeBase()}/api/v1/topics/${topicId}/messages`,
+          { params: { limit }, timeout: 20_000 }
+        );
+        const msgs = mirrorResp.data?.messages ?? [];
+        const decoded = msgs.map(m => {
+          let parsed = null;
+          try { parsed = JSON.parse(Buffer.from(m.message, 'base64').toString('utf8')); } catch {}
+          return { raw: m, parsed };
+        });
+
+        mirrorRecords = campaignId != null
+          ? decoded.filter(({ parsed }) => {
+              if (!parsed) return false;
+              return parsed.entityId === `campaign-${campaignId}` ||
+                     parsed.payload?.campaignId === campaignId ||
+                     (parsed.tags ?? []).includes(`campaign-${campaignId}`);
+            })
+          : decoded.filter(({ parsed }) => !!parsed);
+      } catch (err) {
+        this.logger.warn(`HCS mirror query failed: ${err.message}`);
+      }
     }
 
-    this.logger.info(`NB get_hcs_records topic=${topicId} campaignId=${campaignId ?? 'all'}`);
+    // ── Deduplicate: mirror wins, in-memory fills gaps ────────────────────────
+    const mirrorAuditIds = new Set(mirrorRecords.map(r => r.parsed?.auditId).filter(Boolean));
+    const memOnlyEntries = memEntries.filter(e => !mirrorAuditIds.has(e.auditId));
 
-    const mirrorResp = await axios.get(
-      `${mirrorNodeBase()}/api/v1/topics/${topicId}/messages`,
-      { params: { limit }, timeout: 20_000 }
-    );
-
-    const msgs = mirrorResp.data?.messages ?? [];
-    if (msgs.length === 0) {
-      return `No messages found on HCS topic ${topicId}.`;
+    if (mirrorRecords.length === 0 && memOnlyEntries.length === 0) {
+      const noTopicHint = topicId ? '' : ' (AUDIT_HCS_TOPIC_ID not configured — only in-memory checked)';
+      return `No HCS records found${campaignId != null ? ` for campaign ${campaignId}` : ''}${noTopicHint}.`;
     }
 
-    const decoded = msgs.map(m => {
-      let parsed = null;
-      try { parsed = JSON.parse(Buffer.from(m.message, 'base64').toString('utf8')); } catch { /* raw */ }
-      return { raw: m, parsed };
-    });
+    const lines = [];
+    let n = 1;
 
-    const filtered = campaignId != null
-      ? decoded.filter(({ parsed }) => {
-          const p = parsed?.payload ?? {};
-          return p.campaignId === campaignId ||
-                 parsed?.entityId === `campaign-${campaignId}`;
-        })
-      : decoded;
-
-    if (filtered.length === 0) {
-      return `No HCS records found${campaignId != null ? ` for campaign ${campaignId}` : ''} on topic ${topicId} (${msgs.length} total messages checked).`;
-    }
-
-    const lines = filtered.map(({ raw, parsed }, i) => {
+    for (const { raw, parsed } of mirrorRecords) {
       if (!parsed) {
-        return [
-          `${i + 1}. seq#${raw.sequence_number}  ts=${raw.consensus_timestamp}`,
-          `   (could not decode message)`,
-        ].join('\n');
+        lines.push(`${n++}. seq#${raw.sequence_number}  ts=${raw.consensus_timestamp}\n   (could not decode message)`);
+        continue;
       }
-      const p = parsed.payload ?? {};
-      const eventType = parsed.eventType ?? '?';
-      const entityId  = parsed.entityId  ?? '?';
+      lines.push(this.#fmt(n++, parsed, raw.sequence_number, raw.consensus_timestamp, false));
+    }
 
-      const detail = [];
-      if (eventType === 'CAMPAIGN_CREATED') {
-        detail.push(`   Name:       ${p.name ?? '?'}`);
-        detail.push(`   Voting:     ${p.votingStyle ?? '?'}`);
-        detail.push(`   Start→End:  ${p.startDate ?? '?'} → ${p.endDate ?? '?'}`);
-        detail.push(`   URL:        ${p.votingUrl ?? '?'}`);
-      } else if (eventType === 'CAMPAIGN_FINAL_REPORT') {
-        detail.push(`   Campaign:   ${p.campaignName ?? '?'}  Status: ${p.status ?? '?'}`);
-        detail.push(`   Votes:      ${p.totalVotes ?? '?'}`);
-        if (p.winningProject) {
-          detail.push(`   Winner:     ${p.winningProject.name} (${p.winningProject.votes} vote(s))`);
-        }
-        if (p.note) detail.push(`   Note:       ${p.note}`);
-      } else {
-        const summary = JSON.stringify(p).slice(0, 120);
-        detail.push(`   Payload:    ${summary}${summary.length >= 120 ? '…' : ''}`);
-      }
+    for (const e of memOnlyEntries) {
+      const pseudo = { eventType: e.eventType, entityId: e.entityId, actor: e.actor, auditId: e.auditId, payload: e.payload ?? {} };
+      lines.push(this.#fmt(n++, pseudo, null, e.timestamp, true));
+    }
 
-      return [
-        `${i + 1}. [${eventType}]  seq#${raw.sequence_number}  ts=${raw.consensus_timestamp}`,
-        `   Entity:     ${entityId}`,
-        `   Audit ID:   ${parsed.auditId ?? '?'}`,
-        `   Actor:      ${parsed.actor ?? '?'}`,
-        ...detail,
-      ].join('\n');
-    });
+    const total = mirrorRecords.length + memOnlyEntries.length;
+    const sourceNote = topicId
+      ? ` (${mirrorRecords.length} on-chain, ${memOnlyEntries.length} in-memory)`
+      : ' (in-memory only — AUDIT_HCS_TOPIC_ID not configured)';
 
     return [
-      `HCS records on topic ${topicId}${campaignId != null ? ` for campaign ${campaignId}` : ' (all)'}` +
-        ` — ${filtered.length} record(s)${campaignId != null ? ` (of ${msgs.length} total)` : ''}:`,
+      `HCS records${campaignId != null ? ` for campaign ${campaignId}` : ' (all)'}` +
+        ` — ${total} record(s)${sourceNote}:`,
       '',
       ...lines,
     ].join('\n');
+  }
+
+  #fmt(num, parsed, seqNum, ts, isMemOnly) {
+    const eventType = parsed.eventType ?? '?';
+    const p = parsed.payload ?? {};
+    const memTag = isMemOnly ? ' ⚡in-memory' : '';
+
+    const header = `${num}. [${eventType}]${memTag}  ${seqNum != null ? `seq#${seqNum}  ` : ''}ts=${ts ?? '?'}`;
+    const detail = [];
+    detail.push(`   Entity:     ${parsed.entityId ?? '?'}`);
+    detail.push(`   Audit ID:   ${parsed.auditId ?? '?'}`);
+    detail.push(`   Actor:      ${parsed.actor ?? '?'}`);
+
+    if (eventType === 'CAMPAIGN_CREATED') {
+      if (p.name)        detail.push(`   Name:       ${p.name}`);
+      if (p.votingStyle) detail.push(`   Voting:     ${p.votingStyle}`);
+      if (p.startDate)   detail.push(`   Start→End:  ${p.startDate} → ${p.endDate ?? '?'}`);
+      if (p.votingUrl)   detail.push(`   URL:        ${p.votingUrl}`);
+    } else if (eventType === 'CAMPAIGN_FINAL_REPORT') {
+      if (p.campaignName) detail.push(`   Campaign:   ${p.campaignName}  Status: ${p.status ?? '?'}`);
+      detail.push(`   Votes:      ${p.totalVotes ?? '?'}`);
+      if (p.winningProject) detail.push(`   Winner:     ${p.winningProject.name} (${p.winningProject.votes} vote(s))`);
+      if (p.merkleRoot)     detail.push(`   Merkle:     ${p.merkleRoot}`);
+      if (p.voteHashes?.count != null) detail.push(`   Vote hashes: ${p.voteHashes.count} (compacted on-chain — full hashes in memory)`);
+      if (p.note)           detail.push(`   Note:       ${p.note}`);
+    } else if (eventType === 'DONATION_HBAR_INTENT') {
+      detail.push(`   Amount:     ${p.amount ?? '?'} HBAR (pending HashPack signature)`);
+      detail.push(`   Recipient:  ${p.toAccount ?? p.hbarAddress ?? '?'}`);
+      if (p.memo) detail.push(`   Memo:       ${p.memo}`);
+    } else if (eventType === 'DONATION_HBAR') {
+      detail.push(`   Amount:     ${p.amount ?? '?'} HBAR`);
+      detail.push(`   Recipient:  ${p.toAccount ?? p.hbarAddress ?? '?'}`);
+      if (p.txHash) detail.push(`   Tx Hash:    ${p.txHash}`);
+    } else if (eventType === 'DONATION_CLPR') {
+      detail.push(`   Amount:     ${p.amount ?? '?'} ${p.currency ?? 'CLPR'}`);
+      detail.push(`   Address:    ${p.clprAddress ?? '?'}`);
+      if (p.clprTxHash)   detail.push(`   CLPR Hash:  ${p.clprTxHash}`);
+      if (p.clprProofHash) detail.push(`   Proof:      ${String(p.clprProofHash).slice(0, 24)}…`);
+      if (p.simulated)    detail.push(`   Mode:       simulated`);
+    } else {
+      const summary = JSON.stringify(p).slice(0, 150);
+      detail.push(`   Payload:    ${summary}${summary.length >= 150 ? '…' : ''}`);
+    }
+
+    return [header, ...detail].join('\n');
+  }
+}
+
+// ── nb_generate_hcs_pdf ───────────────────────────────────────────────────────
+
+class GenerateHcsPdfTool extends BaseHederaQueryTool {
+  name = 'nb_generate_hcs_pdf';
+  description =
+    'Generate a comprehensive PDF audit report for a campaign from all HCS records: ' +
+    'campaign creation, final report, and donation payments (HBAR + CLPR). ' +
+    'Returns a download URL. Call this when the user wants a downloadable PDF audit report.';
+  specificInputSchema = z.object({
+    campaignId: z.number().int().min(1).describe('Campaign ID to generate the PDF audit report for.'),
+  });
+  namespace = 'nature-backers-campaign';
+
+  async executeQuery({ campaignId }) {
+    this.logger.info(`NB generate_hcs_pdf campaignId=${campaignId}`);
+
+    // Use an 8 s mirror-node timeout so we never block the whole tool on a slow
+    // Hedera node — fall back to in-memory records only if it times out.
+    const records = await gatherCampaignRecords(campaignId, 100, 8_000);
+    this.logger.info(`NB generate_hcs_pdf: ${records.length} records gathered`);
+
+    await mkdir(TMP_DIR, { recursive: true });
+
+    const filename = `hcs-report-campaign-${campaignId}-${Date.now()}.pdf`;
+    const filepath = join(TMP_DIR, filename);
+
+    // PDFDocument is pre-imported at module level — no dynamic-import stall
+    const doc = new PDFDocument({ margin: 50, size: 'A4', bufferPages: false });
+    const stream = createWriteStream(filepath);
+    doc.pipe(stream);
+
+    // ── Header ──────────────────────────────────────────────────────────────
+    doc.fontSize(20).font('Helvetica-Bold')
+      .text('CarbonSustain HCS Audit Report', { align: 'center' });
+    doc.fontSize(13).font('Helvetica')
+      .text(`Campaign ID: ${campaignId}`, { align: 'center' });
+    const topicId = process.env.AUDIT_HCS_TOPIC_ID || process.env.AUDIT_TOPIC_ID;
+    if (topicId) {
+      doc.fontSize(9).fillColor('#555555')
+        .text(`HCS Topic: ${topicId}`, { align: 'center' });
+      doc.fillColor('#000000');
+    }
+    doc.fontSize(9).fillColor('#555555')
+      .text(`Generated: ${new Date().toISOString()}`, { align: 'center' });
+    doc.fillColor('#000000').moveDown();
+    doc.moveTo(50, doc.y).lineTo(545, doc.y).stroke().moveDown();
+
+    if (records.length === 0) {
+      doc.fontSize(12).text('No HCS records found for this campaign.', { align: 'center' });
+    } else {
+      const byType = (types) => records.filter(r => types.includes(r.eventType));
+      const creation    = byType(['CAMPAIGN_CREATED'])[0];
+      const finalReport = byType(['CAMPAIGN_FINAL_REPORT'])[0];
+      const donations   = byType(['DONATION_HBAR_INTENT', 'DONATION_HBAR', 'DONATION_CLPR']);
+      const other       = records.filter(r =>
+        !['CAMPAIGN_CREATED', 'CAMPAIGN_FINAL_REPORT',
+          'DONATION_HBAR_INTENT', 'DONATION_HBAR', 'DONATION_CLPR'].includes(r.eventType)
+      );
+
+      // ── Campaign Creation ──────────────────────────────────────────────────
+      if (creation) {
+        this.#section(doc, 'Campaign Creation');
+        const p = creation.payload;
+        this.#field(doc, 'Campaign Name',   p.name         ?? '—');
+        this.#field(doc, 'Voting Style',    p.votingStyle  ?? '—');
+        this.#field(doc, 'Start Date',      p.startDate    ?? '—');
+        this.#field(doc, 'End Date',        p.endDate      ?? '—');
+        this.#field(doc, 'Voting URL',      p.votingUrl    ?? '—');
+        this.#field(doc, 'Actor',           creation.actor ?? '—');
+        this.#field(doc, 'Audit ID',        creation.auditId ?? '—');
+        this.#field(doc, 'Recorded At',     creation.timestamp ?? '—');
+        if (creation.hcsSeq != null) this.#field(doc, 'HCS Seq#', String(creation.hcsSeq));
+        this.#divider(doc);
+      }
+
+      // ── Final Report ───────────────────────────────────────────────────────
+      if (finalReport) {
+        this.#section(doc, 'Campaign Final Report');
+        const p = finalReport.payload;
+        this.#field(doc, 'Campaign',     `${p.campaignName ?? '—'} (ID: ${p.campaignId ?? campaignId})`);
+        this.#field(doc, 'Status',       p.status ?? '—');
+        this.#field(doc, 'Period',       `${p.startDate ?? '—'} → ${p.endDate ?? '—'}`);
+        this.#field(doc, 'Total Votes',  String(p.totalVotes ?? 0));
+        if (p.winningProject) {
+          this.#field(doc, 'Winning Project', `${p.winningProject.name} (${p.winningProject.votes} vote(s))`);
+        }
+        if (p.merkleRoot) this.#field(doc, 'Merkle Root', p.merkleRoot);
+        if (p.hederaTxHash) this.#field(doc, 'Hedera Tx Hash', p.hederaTxHash);
+
+        if (Array.isArray(p.projects) && p.projects.length > 0) {
+          doc.moveDown(0.3).fontSize(11).font('Helvetica-Bold').text('Vote Breakdown:');
+          doc.font('Helvetica').fontSize(10);
+          for (const proj of p.projects) {
+            doc.text(`  • ${proj.projectName ?? proj.projectId}: ${proj.votes} vote(s)`);
+          }
+        }
+
+        if (Array.isArray(p.voteHashes) && p.voteHashes.length > 0) {
+          doc.moveDown(0.3).fontSize(11).font('Helvetica-Bold').text('Vote Hashes (Merkle Leaves):');
+          doc.font('Helvetica').fontSize(8);
+          for (const v of p.voteHashes) {
+            doc.text(`  Vote ${v.voteId} (${v.projectName}): ${v.voteHash ?? '(pending)'}`,
+              { lineBreak: true, width: 450 });
+          }
+          doc.fontSize(10);
+        } else if (p.voteHashes?.count) {
+          doc.moveDown(0.3).fontSize(10).font('Helvetica')
+            .text(`Vote hashes: ${p.voteHashes.count} (stored compactly on-chain — verify via Merkle Root above)`);
+        }
+
+        this.#field(doc, 'Audit ID',    finalReport.auditId ?? '—');
+        this.#field(doc, 'Recorded At', finalReport.timestamp ?? '—');
+        if (finalReport.hcsSeq != null) this.#field(doc, 'HCS Seq#', String(finalReport.hcsSeq));
+        this.#divider(doc);
+      }
+
+      // ── Donations ──────────────────────────────────────────────────────────
+      if (donations.length > 0) {
+        this.#section(doc, `Donation Records (${donations.length})`);
+        for (let i = 0; i < donations.length; i++) {
+          const d = donations[i];
+          const p = d.payload;
+          doc.fontSize(11).font('Helvetica-Bold')
+            .text(`${i + 1}. ${d.eventType}`);
+          doc.font('Helvetica').fontSize(10);
+          if (d.eventType === 'DONATION_HBAR_INTENT') {
+            this.#field(doc, 'Amount',    `${p.amount ?? '?'} HBAR (pending HashPack signature)`);
+            this.#field(doc, 'Recipient', p.toAccount ?? p.hbarAddress ?? '—');
+            if (p.memo) this.#field(doc, 'Memo', p.memo);
+          } else if (d.eventType === 'DONATION_HBAR') {
+            this.#field(doc, 'Amount',    `${p.amount ?? '?'} HBAR`);
+            this.#field(doc, 'Recipient', p.toAccount ?? p.hbarAddress ?? '—');
+            if (p.txHash) this.#field(doc, 'Tx Hash', p.txHash);
+          } else if (d.eventType === 'DONATION_CLPR') {
+            this.#field(doc, 'Amount',    `${p.amount ?? '?'} ${p.currency ?? 'CLPR'}`);
+            this.#field(doc, 'Address',   p.clprAddress ?? '—');
+            if (p.clprTxHash)   this.#field(doc, 'CLPR Tx Hash',  p.clprTxHash);
+            if (p.clprProofHash) this.#field(doc, 'Proof Hash', p.clprProofHash);
+            if (p.simulated)    this.#field(doc, 'Mode', 'Simulated');
+          }
+          this.#field(doc, 'Actor',      d.actor ?? '—');
+          this.#field(doc, 'Audit ID',   d.auditId ?? '—');
+          this.#field(doc, 'Timestamp',  d.timestamp ?? p.timestamp ?? '—');
+          if (d.hcsSeq != null) this.#field(doc, 'HCS Seq#', String(d.hcsSeq));
+          doc.moveDown(0.4);
+        }
+        this.#divider(doc);
+      }
+
+      // ── Other events ───────────────────────────────────────────────────────
+      if (other.length > 0) {
+        this.#section(doc, 'Other Audit Events');
+        for (let i = 0; i < other.length; i++) {
+          const e = other[i];
+          doc.fontSize(11).font('Helvetica-Bold').text(`${i + 1}. ${e.eventType}`);
+          doc.font('Helvetica').fontSize(10);
+          this.#field(doc, 'Entity',    e.entityId ?? '—');
+          this.#field(doc, 'Actor',     e.actor    ?? '—');
+          this.#field(doc, 'Audit ID',  e.auditId  ?? '—');
+          this.#field(doc, 'Timestamp', e.timestamp ?? '—');
+          const summary = JSON.stringify(e.payload ?? {}).slice(0, 200);
+          this.#field(doc, 'Payload',   summary + (summary.length >= 200 ? '…' : ''));
+          doc.moveDown(0.4);
+        }
+      }
+    }
+
+    // ── Footer ───────────────────────────────────────────────────────────────
+    doc.moveDown(2).fontSize(8).fillColor('#888888')
+      .text('Generated by CarbonSustain / NatureBackers Enterprise Agent', { align: 'center' })
+      .text('All records are immutably stored on the Hedera Consensus Service (HCS)', { align: 'center' });
+
+    // Flush and wait for the stream to close, with a hard 15 s timeout.
+    // If the timeout fires or there is an IO error, destroy the stream so
+    // the Promise resolves rather than hanging the agent forever.
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.logger.warn('NB generate_hcs_pdf: stream write timed out — destroying stream');
+        stream.destroy(new Error('PDF stream write timed out after 15 s'));
+      }, 15_000);
+
+      stream.on('finish', () => { clearTimeout(timer); resolve(); });
+      stream.on('error',  (err) => { clearTimeout(timer); reject(err); });
+      stream.on('close',  () => { clearTimeout(timer); resolve(); });
+
+      doc.end();
+    });
+
+    this.logger.info(`NB generate_hcs_pdf: wrote ${filepath}`);
+
+    const publicUrl = (process.env.PUBLIC_URL || 'http://localhost:3001').replace(/\/$/, '');
+    const downloadUrl = `${publicUrl}/api/reports/${filename}`;
+    const onChain  = records.filter(r => r.source === 'mirror').length;
+    const inMemory = records.filter(r => r.source === 'memory').length;
+
+    return [
+      `PDF Audit Report Generated`,
+      ``,
+      `Campaign ID:    ${campaignId}`,
+      `Records:        ${records.length} total (${onChain} on-chain, ${inMemory} in-memory)`,
+      `Download URL:   ${downloadUrl}`,
+    ].join('\n');
+  }
+
+  #section(doc, title) {
+    doc.fontSize(14).font('Helvetica-Bold').text(title).moveDown(0.3);
+  }
+
+  #field(doc, label, value) {
+    doc.fontSize(10).font('Helvetica-Bold')
+      .text(`${label}: `, { continued: true })
+      .font('Helvetica').text(String(value ?? ''), { lineBreak: true, width: 450 });
+  }
+
+  #divider(doc) {
+    doc.moveDown(0.5)
+      .moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#cccccc').stroke()
+      .strokeColor('#000000').moveDown(0.5);
   }
 }
 
@@ -1319,6 +1700,7 @@ export class NatureBackersCampaignPlugin extends BasePlugin {
       new RecordCampaignReportTool(cfg),
       new GetCampaignHcsReportTool(cfg),
       new GetHcsRecordsTool(cfg),
+      new GenerateHcsPdfTool(cfg),
       new GetVotesByCampaignTool(cfg),
     ];
   }

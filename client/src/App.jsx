@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react';
 import AgentChat from './components/AgentChat.jsx';
 import VotePage from './components/VotePage.jsx';
+import IndexerPage from './components/IndexerPage.jsx';
 import HashPackDonate from './components/HashPackDonate.jsx';
+import nbAgentIcon from '../nb_agent_icon.png';
 import './App.css';
 
 const COINGECKO_URL =
@@ -66,13 +68,23 @@ export default function App() {
     return <VotePage campaignId={voteMatch[1]} />;
   }
 
+  // /indexer/:timestamp route — in-app Guardian VC document viewer
+  const indexerMatch = pathname.match(/^\/indexer\/(.+)$/);
+  if (indexerMatch) {
+    return <IndexerPage timestamp={decodeURIComponent(indexerMatch[1])} />;
+  }
+
   return (
     <div className="app">
       <header className="app-header">
-        <span className="logo">🌿</span>
+        <img src={nbAgentIcon} alt="Nature Backers Agent" className="logo-icon" />
         <div className="app-header__text">
-          <h1>CarbonSustain</h1>
-          <p>Nature-Based Solutions Agent — powered by NatureBackers</p>
+          <h1>
+            <span className="logo-name">nature backers</span>
+            {' '}
+            <span className="logo-agent">agent</span>
+          </h1>
+          <p>Built with CarbonSustain</p>
         </div>
         <HbarTicker />
         <HashPackDonate />

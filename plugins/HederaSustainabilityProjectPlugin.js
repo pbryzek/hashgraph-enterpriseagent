@@ -259,7 +259,8 @@ function parseFromTextSearch(textSearch) {
 
 // ── Formatter ──────────────────────────────────────────────────────────────────
 
-const INDEXER_BASE_URL = process.env.NATURE_BACKERS_API_URL ?? 'https://indexer.guardianservice.app/api/v1/mainnet';
+// Always link to mainnet regardless of which indexer the API calls hit.
+const INDEXER_BASE_URL = 'https://indexer.guardianservice.app/api/v1/mainnet';
 
 function formatProject(item, index) {
   const hederaId  = item.consensusTimestamp ?? item.uuid ?? `item-${index}`;
@@ -294,7 +295,7 @@ function formatProject(item, index) {
     }
   }
 
-  const sourceUrl = `${INDEXER_BASE_URL}/entities/vc-documents/${encodeURIComponent(hederaId)}`;
+  const sourceUrl = `/indexer/${encodeURIComponent(hederaId)}`;
 
   return [
     `${index + 1}. ${name}`,
@@ -303,7 +304,7 @@ function formatProject(item, index) {
     projectType ? `   Type: ${projectType}` : null,
     sdgs.length > 0 ? `   SDGs: ${sdgs.slice(0, 6).join(', ')}` : null,
     location ? `   Location: ${location}` : null,
-    `   Source: ${sourceUrl}`,
+    `   🔗 Indexer: [Verify on Guardian Mainnet](${sourceUrl})`,
   ].filter(Boolean).join('\n');
 }
 
@@ -450,7 +451,7 @@ class GetProjectDetailTool extends BaseHederaQueryTool {
     const doc  = resp.data;
     if (!doc) return `No project found with ID: ${messageId}`;
 
-    const sourceUrl = `${INDEXER_BASE_URL}/entities/vc-documents/${encodeURIComponent(messageId)}`;
+    const sourceUrl = `/indexer/${encodeURIComponent(messageId)}`;
     const cs = extractCs(doc);
 
     if (cs) {

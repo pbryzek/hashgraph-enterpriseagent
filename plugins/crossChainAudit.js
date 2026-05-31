@@ -31,6 +31,40 @@ export function storeAuditSummary(entry) {
   auditLog.push(entry);
 }
 
+// ── HCS message compactor ─────────────────────────────────────────────────────
+// HCS messages have a ~1024-byte limit; chunked messages break JSON parsing on
+// the mirror node API. Strip large arrays from the payload when over budget.
+
+function compactForHCS(envelope) {
+  const MAX_BYTES = 950;
+  const msg = JSON.stringify(envelope);
+  if (Buffer.byteLength(msg, 'utf8') <= MAX_BYTES) return envelope;
+
+  const compacted = JSON.parse(msg);
+  const p = compacted.payload;
+  if (p) {
+    if (Array.isArray(p.voteHashes) && p.voteHashes.length > 0) {
+      p.voteHashes = { count: p.voteHashes.length, note: 'hashes omitted — verify via merkleRoot' };
+    }
+    if (Array.isArray(p.projects)) {
+      p.projects = p.projects.map(pr => ({ projectId: pr.projectId, projectName: pr.projectName, votes: pr.votes }));
+    }
+    if (typeof p.note === 'string' && p.note.length > 150) p.note = p.note.slice(0, 150) + '…';
+    if (typeof p.emailBody === 'string') delete p.emailBody;
+  }
+  compacted._hcsCompacted = true;
+
+  const msg2 = JSON.stringify(compacted);
+  if (Buffer.byteLength(msg2, 'utf8') <= MAX_BYTES) return compacted;
+
+  // Still too large — strip remaining large fields
+  if (compacted.payload) {
+    delete compacted.payload.projectTally;
+    delete compacted.payload.projects;
+  }
+  return compacted;
+}
+
 /**
  * @param {{ eventType?, entityId?, actor?, status?, tag? }} filters
  */
@@ -62,7 +96,8 @@ function getHederaClient() {
 
 async function writeToHCS(payload, integrityHash) {
   const topicId = process.env.AUDIT_HCS_TOPIC_ID || process.env.AUDIT_TOPIC_ID;
-  const message = JSON.stringify({ ...payload, integrityHash });
+  const envelope = compactForHCS({ ...payload, integrityHash });
+  const message = JSON.stringify(envelope);
 
   if (!topicId) {
     return {
@@ -77,6 +112,7 @@ async function writeToHCS(payload, integrityHash) {
     const tx      = await new TopicMessageSubmitTransaction()
       .setTopicId(topicId)
       .setMessage(message)
+      .setMaxChunks(10)
       .execute(client);
     const receipt = await tx.getReceipt(client);
 
@@ -161,7 +197,7 @@ export async function recordCrossChainAudit({ eventType, entityId, actor, payloa
     timestamp: new Date().toISOString(),
   };
 
-  storeAuditSummary({ ...summary, hcs, clpr });
+  storeAuditSummary({ ...summary, hcs, clpr, payload });
 
   return { auditId, hcs, clpr, summary };
 }

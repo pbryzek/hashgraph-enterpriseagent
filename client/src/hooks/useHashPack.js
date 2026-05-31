@@ -100,21 +100,26 @@ export function useHashPack() {
     setAccountId(null);
   }, []);
 
-  const sendHbar = useCallback(async (amountHbar, toAccountOverride) => {
+  const sendHbar = useCallback(async (amountHbar, toAccountOverride, onTxId) => {
     if (!connectorRef.current || !accountId) throw new Error('Wallet not connected');
     const recipient = toAccountOverride ?? adminAccountId;
     if (!recipient) throw new Error('Recipient account not configured');
 
-    const { TransferTransaction, Hbar, AccountId } = await import('@hashgraph/sdk');
+    const { TransferTransaction, Hbar, AccountId, TransactionId } = await import('@hashgraph/sdk');
 
     const fromId  = AccountId.fromString(accountId);
     const toId    = AccountId.fromString(recipient);
     const signer  = connectorRef.current.getSigner(fromId);
 
-    const tx = await new TransferTransaction()
+    // Manually generate transaction ID so we can track it even if HashPack hangs
+    const txIdObj = TransactionId.generate(fromId);
+    const txIdStr = txIdObj.toString();
+    if (onTxId) onTxId(txIdStr);
+
+    const tx = new TransferTransaction()
+      .setTransactionId(txIdObj)
       .addHbarTransfer(fromId, new Hbar(-amountHbar))
-      .addHbarTransfer(toId,   new Hbar(amountHbar))
-      .freezeWithSigner(signer);
+      .addHbarTransfer(toId,   new Hbar(amountHbar));
 
     return tx.executeWithSigner(signer);
   }, [accountId, adminAccountId]);

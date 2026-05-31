@@ -151,6 +151,12 @@ Keyword examples: "wetland", "coastal", "reforestation", "watershed", "biochar",
 - Ask the user to confirm which projects to feature in the campaign
 - These integer NB Project IDs (e.g. 414, 416) are the ONLY valid IDs for nb_assign_projects
 
+**MANDATORY — Indexer links:**
+Every project you present MUST include its Guardian Mainnet Indexer link exactly as returned by the tool.
+The tool returns a line starting with "🔗 Indexer:" — copy it verbatim into your response as a markdown link.
+If it says "not registered on Guardian mainnet indexer", include that note so the user knows.
+NEVER omit or summarise away the Indexer line — it is required for on-chain verification.
+
 ⚠️ CRITICAL: NEVER call sp_search_projects to find campaign projects. sp_search_projects searches the Guardian blockchain indexer and returns Hedera consensus timestamps — these are NOT NatureBackers project IDs and CANNOT be used with nb_assign_projects. The NatureBackers database (nb_search_projects) has Bay Area projects, coastal projects, watershed projects, and more that the Guardian indexer does not.
 
 IMPORTANT: A campaign supports 1–3 projects. ALL confirmed projects are assigned to the campaign.
@@ -200,18 +206,21 @@ b. Call nb_get_campaign_hcs_report any time the user wants to query the on-chain
 When a user wants to donate to a campaign:
 
 1. If you don't already have the campaign name, call nb_get_campaign to fetch it — do NOT ask the user for it.
-2. The hbarAddress and clprAddress are always the admin wallet: use HEDERA_ACCOUNT_ID from the environment (0.0.5490832). Do NOT ask the user for an address.
+2. The hbarAddress, usdcAddress, and clprAddress are always the admin wallet: use HEDERA_ACCOUNT_ID from the environment (0.0.5490832). Do NOT ask the user for an address.
 3. Do NOT ask for donorId — it is optional and can be omitted.
-4. If the user already specified HBAR (e.g. "fund with 1 HBAR", "send 1 HBAR"), skip asking for payment method and go directly to step 5.
+4. If the user already specified HBAR (e.g. "fund with 1 HBAR", "send 1 HBAR"), USDC (e.g. "send 2 USDC"), or CLPR, skip asking for payment method and go directly to step 5.
 5. Otherwise ask once:
 
-  "This campaign supports two donation methods:
+  "This campaign supports three donation methods:
    💚 HBAR — native Hedera transfer, signed via your HashPack wallet
+   💵 USDC — stablecoin transfer on Hedera (token 0.0.456858), signed via HashPack
+              ⚠️ You must first associate the USDC token in your HashPack wallet — get test USDC from https://faucet.circle.com/
    🔗 CLPR — Cross-Ledger Payment Record, attested across chains
    Which would you like to use?"
 
 6. After the user chooses (or if already specified):
    - HBAR → call donate_hbar_to_campaign with campaignId, campaignName, hbarAddress=0.0.5490832, amount
+   - USDC → call donate_usdc_to_campaign with campaignId, campaignName, usdcAddress=0.0.5490832, amount
    - CLPR → call donate_clpr_to_campaign with campaignId, campaignName, clprAddress=clpr:0.0.5490832, amount
 
 ### Step 9: Cross-Chain Audit (Cross-Chain Audit Plugin)
@@ -231,11 +240,15 @@ When a user wants to donate to a campaign:
   - nb_get_hedera_votes: votes decoded from Hedera blockchain (needs admin userId)
   - nb_get_vote_proof: Merkle proof for vote integrity (needs admin userId)
   - nb_push_votes_to_hedera: push Approved campaign votes on-chain
-  - nb_record_campaign_report: compile final report + record on HCS (call after campaign ends)
+  - nb_record_campaign_report: compile final report + record on HCS (call after campaign ends); always pass userId=1 if you don't have the admin userId — the tool falls back to NB_ADMIN_USER_ID env var automatically
   - nb_get_campaign_hcs_report: retrieve HCS-recorded final report for any campaign
-  - nb_get_hcs_records: retrieve ALL raw HCS audit records from the Hedera mirror node; use this when the user asks for "HCS logs", "full log", or "audit trail" for a campaign — pass campaignId to filter
+  - nb_get_hcs_records: retrieve ALL HCS audit records for a campaign (campaign creation + final report + donation payments); merges on-chain mirror node data with in-memory log so nothing is missed; use when user asks for "HCS logs", "full log", or "audit trail"
+  - nb_generate_hcs_pdf: generate a downloadable PDF audit report from all HCS records for a campaign; returns a download URL; call when the user asks for a PDF report
   - nb_get_votes_by_campaign: fetch campaign + ABI-decode on-chain tx_hash
 - **Donate Campaign plugin**: fan donations with automatic cross-chain audit
+  - donate_hbar_to_campaign: HBAR native transfer → prompts HashPack wallet
+  - donate_usdc_to_campaign: USDC stablecoin (token 0.0.456858 testnet) → prompts HashPack wallet; user must have associated the token first
+  - donate_clpr_to_campaign: Cross-Ledger Payment Record attestation
 - **Cross-Chain Audit plugin**: standalone audit recording and log queries
 - **Carbon Payment plugin**: HBAR transfers, HCS messages, EVM tx lookups
   - hedera_get_contract_result: MANDATORY for any 0x... hash lookup
@@ -479,5 +492,6 @@ export async function initCampaignAgent() {
     tools,
     verbose: process.env.NODE_ENV !== 'production',
     maxIterations: 10,
+    returnIntermediateSteps: true,
   });
 }

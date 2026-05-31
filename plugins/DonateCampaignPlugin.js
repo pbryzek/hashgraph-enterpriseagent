@@ -18,6 +18,7 @@ import { z } from 'zod';
 import { BasePlugin, BaseHederaQueryTool } from 'hedera-agent-kit';
 import { recordCrossChainAudit } from './crossChainAudit.js';
 
+
 function getHederaClient() {
   const network = (process.env.HEDERA_NETWORK || 'testnet').toLowerCase();
   const client  = network === 'mainnet' ? Client.forMainnet() : Client.forTestnet();
@@ -62,6 +63,24 @@ class DonateHbarTool extends BaseHederaQueryTool {
   async executeQuery({ campaignId, campaignName, hbarAddress, amount }) {
     this.logger.info(`Donate HBAR: requesting ${amount} HBAR → campaign ${campaignId} (${hbarAddress}) via user wallet`);
 
+    const memo = `NatureBackers campaign ${campaignId} donation`.slice(0, 100);
+
+    // Fire-and-forget HCS audit for the donation intent so it appears in nb_get_hcs_records
+    recordCrossChainAudit({
+      eventType: 'DONATION_HBAR_INTENT',
+      entityId:  `campaign-${campaignId}`,
+      actor:     'user-wallet',
+      payload: {
+        campaignId,
+        campaignName,
+        toAccount: hbarAddress,
+        amount,
+        memo,
+        timestamp: new Date().toISOString(),
+      },
+      tags: ['hbar-intent', `campaign-${campaignId}`, 'donation'],
+    }).catch(err => this.logger.warn(`HBAR intent HCS audit failed: ${err.message}`));
+
     // Return a HashPack payment request — the frontend will prompt the user
     // to sign the transfer from their connected wallet (not the backend account).
     return JSON.stringify({
@@ -70,7 +89,71 @@ class DonateHbarTool extends BaseHederaQueryTool {
       campaignName,
       toAccount:    hbarAddress,
       amount,
-      memo:         `NatureBackers campaign ${campaignId} donation`.slice(0, 100),
+      memo,
+    });
+  }
+}
+
+// ── donate_usdc_to_campaign ───────────────────────────────────────────────────
+
+const DonateUsdcSchema = z.object({
+  campaignId: z
+    .number().int().min(1)
+    .describe('Numeric Nature Backers campaign ID.'),
+  campaignName: z
+    .string().optional().default('Campaign')
+    .describe('Human-readable campaign name — fetch via nb_get_campaign if unknown.'),
+  usdcAddress: z
+    .string().optional().default('0.0.5490832')
+    .describe('Recipient Hedera account ID for USDC. Always use 0.0.5490832 (admin wallet) unless told otherwise.'),
+  amount: z
+    .number().min(0.000001)
+    .describe('Amount of USDC to donate (e.g. 1.5 for $1.50).'),
+  donorId: z
+    .string().optional()
+    .describe('Donor identifier for the audit trail.'),
+});
+
+class DonateUsdcTool extends BaseHederaQueryTool {
+  name = 'donate_usdc_to_campaign';
+  description =
+    'Donate USDC stablecoin to a Nature Backers campaign via HashPack. ' +
+    'Token ID on testnet is 0.0.456858. The user must have already associated that token ' +
+    'in their HashPack wallet (get test USDC from https://faucet.circle.com/). ' +
+    'Call this after the user confirms they want to donate via USDC. ' +
+    'Always confirm amount and address with the user first.';
+  specificInputSchema = DonateUsdcSchema;
+  namespace = 'donate-campaign';
+
+  async executeQuery({ campaignId, campaignName, usdcAddress, amount }) {
+    this.logger.info(`Donate USDC: requesting ${amount} USDC → campaign ${campaignId} (${usdcAddress}) via user wallet`);
+
+    const memo = `NatureBackers campaign ${campaignId} USDC donation`.slice(0, 100);
+
+    recordCrossChainAudit({
+      eventType: 'DONATION_USDC_INTENT',
+      entityId:  `campaign-${campaignId}`,
+      actor:     'user-wallet',
+      payload: {
+        campaignId,
+        campaignName,
+        toAccount: usdcAddress,
+        amount,
+        currency: 'USDC',
+        tokenId:  '0.0.456858',
+        memo,
+        timestamp: new Date().toISOString(),
+      },
+      tags: ['usdc-intent', `campaign-${campaignId}`, 'donation'],
+    }).catch(err => this.logger.warn(`USDC intent HCS audit failed: ${err.message}`));
+
+    return JSON.stringify({
+      __type:       'hashpack_usdc_payment_request',
+      campaignId,
+      campaignName,
+      toAccount:    usdcAddress,
+      amount,
+      memo,
     });
   }
 }
@@ -203,6 +286,7 @@ export class DonateCampaignPlugin extends BasePlugin {
     await super.initialize(context);
     this.#tools = [
       new DonateHbarTool({ hederaKit: context.config.hederaKit, logger: context.logger }),
+      new DonateUsdcTool({ hederaKit: context.config.hederaKit, logger: context.logger }),
       new DonateCLPRTool({ hederaKit: context.config.hederaKit, logger: context.logger }),
     ];
   }

@@ -25,14 +25,26 @@ body {
   background: #fff;
 }
 
-.logo {
-  font-size: 2rem;
+.logo-icon {
+  width: 34px;
+  height: 34px;
+  object-fit: contain;
+  flex-shrink: 0;
 }
 
 .app-header h1 {
   font-size: 1.25rem;
   font-weight: 700;
-  color: #14532d;
+}
+
+.logo-name {
+  color: #6DBE45;
+  font-weight: 700;
+}
+
+.logo-agent {
+  color: #3DBFBF;
+  font-weight: 400;
 }
 
 .app-header p {
