@@ -106,10 +106,21 @@ function StatusBubble({ steps }) {
   );
 }
 
+// Always show campaign dates in IST (Asia/Kolkata) so the user can verify
+// the conversion regardless of their browser's system timezone.
+function toIST(isoStr) {
+  if (!isoStr) return null;
+  return new Date(isoStr).toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: true,
+  }) + ' IST';
+}
+
 // ── Campaign approval card ────────────────────────────────────────────────────
 function ApprovalCard({ preview, onApprove, onCancel }) {
-  const start = preview.startDate ? new Date(preview.startDate).toLocaleString() : 'now + 1 min';
-  const end   = preview.endDate   ? new Date(preview.endDate).toLocaleString()   : 'start + 1 hr';
+  const start = preview.startDate ? toIST(preview.startDate) : 'now + 1 min';
+  const end   = preview.endDate   ? toIST(preview.endDate)   : 'start + 1 hr';
 
   return (
     <div className="approval-card" style={{ borderLeft: '4px solid #eab308' }}>
@@ -748,17 +759,17 @@ function RegistrationCard({ onComplete, onSkip }) {
         <div className="approval-card__body">
           <div className="reg-field">
             <label>First Name</label>
-            <input type="text" placeholder="Jane" value={form.firstName} disabled={loading}
+            <input type="text" placeholder="" value={form.firstName} disabled={loading}
               onChange={e => setForm(f => ({ ...f, firstName: e.target.value }))} />
           </div>
           <div className="reg-field">
             <label>Last Name</label>
-            <input type="text" placeholder="Doe" value={form.lastName} disabled={loading}
+            <input type="text" placeholder="" value={form.lastName} disabled={loading}
               onChange={e => setForm(f => ({ ...f, lastName: e.target.value }))} />
           </div>
           <div className="reg-field">
             <label>Business Email</label>
-            <input type="email" placeholder="jane@company.com" value={form.email} disabled={loading}
+            <input type="email" placeholder="sample@company.com" value={form.email} disabled={loading}
               onChange={e => setForm(f => ({ ...f, email: e.target.value }))} />
           </div>
           {error && <p className="reg-error">{error}</p>}
@@ -784,10 +795,11 @@ export default function AgentChat() {
   const [steps, setSteps]                     = useState([]);
   const [phase, setPhase]                     = useState('research');
   const [showTransition, setShowTransition]   = useState(false);
-  const [pendingApproval, setPendingApproval]     = useState(null);
-  const [pendingPayment, setPendingPayment]       = useState(null);
+  const [pendingApproval, setPendingApproval]       = useState(null);
+  const [pendingPayment, setPendingPayment]         = useState(null);
   const [pendingUsdcPayment, setPendingUsdcPayment] = useState(null);
-  const [pendingUserReg, setPendingUserReg]       = useState(false);
+  const [pendingQrCode, setPendingQrCode]           = useState(null);
+  const [pendingUserReg, setPendingUserReg]         = useState(false);
   const bottomRef = useRef(null);
 
   useEffect(() => {
@@ -806,6 +818,7 @@ export default function AgentChat() {
     setSteps([]);
     setShowTransition(false);
     setPendingApproval(null);
+    setPendingQrCode(null);
     // Keep pendingPayment visible across turns until signed or dismissed
 
     const userMsg = { role: 'user', content: trimmed };
@@ -885,6 +898,13 @@ export default function AgentChat() {
         if (event.payment) {
           console.log('[AgentChat] Setting pendingUsdcPayment:', event.payment);
           setPendingUsdcPayment(event.payment);
+        }
+        break;
+
+      case 'qr_code':
+        if (event.url) {
+          console.log('[AgentChat] Setting pendingQrCode:', event.url);
+          setPendingQrCode(event.url);
         }
         break;
 
@@ -1077,6 +1097,31 @@ export default function AgentChat() {
               setPendingUsdcPayment(null);
             }}
           />
+        )}
+
+        {pendingQrCode && (
+          <div className="approval-card" style={{ borderLeft: '4px solid #7c3aed' }}>
+            <div className="approval-card__header">
+              <span className="approval-card__icon">📱</span>
+              <span className="approval-card__title">Campaign QR Code — Scan to Vote</span>
+            </div>
+            <div style={{ padding: '12px 16px', textAlign: 'center' }}>
+              <img
+                src={pendingQrCode}
+                alt="Campaign voting QR code"
+                style={{ width: 200, height: 200, display: 'block', margin: '0 auto 10px' }}
+                onError={e => { e.target.style.display = 'none'; }}
+              />
+              <a
+                href={pendingQrCode}
+                target="_blank"
+                rel="noreferrer"
+                style={{ fontSize: '0.78rem', color: '#7c3aed' }}
+              >
+                Open QR image ↗
+              </a>
+            </div>
+          </div>
         )}
 
         {showTransition && !loading && !pendingApproval && (

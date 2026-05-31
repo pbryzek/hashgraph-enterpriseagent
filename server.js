@@ -15,6 +15,8 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { HumanMessage, AIMessage, ToolMessage } from '@langchain/core/messages';
 import { initResearchAgent, initCampaignAgent } from './agent.js';
+import PDFDocument from 'pdfkit';
+import { gatherCampaignRecords, renderHcsPdfContent } from './plugins/NatureBackersCampaignPlugin.js';
 
 const __serverDir = dirname(fileURLToPath(import.meta.url));
 
@@ -262,55 +264,60 @@ app.post('/api/agent', async (req, res) => {
             },
             handleToolEnd(rawOutput) {
               console.log(`[AGENT API] Tool End: ${currentToolName} | rawOutput length: ${rawOutput?.length}`);
-              console.log(`[DEBUG] handleToolEnd called for ${currentToolName}. rawOutput:`, rawOutput?.slice(0, 200));
+
+              // Resolve textStr regardless of whether the output is a JSON-wrapped
+              // LangChain object or a plain string — detection logic runs on textStr
+              // after the try block so it is never silently skipped by the catch.
+              let textStr = typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput ?? '');
               try {
                 const parsed = JSON.parse(rawOutput);
                 const text = parsed?.data ?? parsed?.output ?? rawOutput;
-                const textStr = typeof text === 'string' ? text : JSON.stringify(text);
-                toolOutputs.push(textStr);
+                textStr = typeof text === 'string' ? text : JSON.stringify(text);
                 if (parsed.transactionId) txIds.push(parsed.transactionId);
                 if (parsed.receipt?.transactionId)
                   txIds.push(String(parsed.receipt.transactionId));
+              } catch { /* rawOutput is a plain string — textStr already set above */ }
 
-                // Detect campaign preview for approval flow
-                if (currentToolName === 'nb_preview_campaign') {
-                  try {
-                    const preview = JSON.parse(textStr);
-                    if (preview?.__type === 'campaign_preview') {
-                      pendingApproval = preview;
-                      console.log('[AGENT API] Detected campaign preview');
-                      send({ type: 'approval_request', campaignPreview: preview });
-                    }
-                  } catch { /* not JSON, ignore */ }
-                }
+              toolOutputs.push(textStr);
+              console.log(`[DEBUG] handleToolEnd ${currentToolName}. textStr:`, textStr?.slice(0, 150));
 
-                // Detect HashPack payment request. The tool result is wrapped by
-                // LangChain as {success, data:"<json>"}, so the payload lives in
-                // textStr (the unwrapped data), not rawOutput. Parse textStr the
-                // same way the campaign-preview detector above does.
-                console.log(`[DEBUG] Tool ${currentToolName} ended. textStr:`, textStr?.slice(0, 100));
-                if (textStr && textStr.includes('hashpack_payment_request')) {
-                  console.log('[DEBUG] Detected hashpack_payment_request keyword in textStr:', textStr);
-                  try {
-                    const payment = JSON.parse(textStr);
-                    console.log('[DEBUG] Parsed payment object:', JSON.stringify(payment, null, 2));
-                    if (payment?.__type === 'hashpack_payment_request') {
-                      console.log('[DEBUG] Confirmed hashpack_payment_request type. Setting pendingPayment and sending to client.');
-                      pendingPayment = payment;
-                      send({ type: 'hashpack_payment', payment });
-                    } else if (payment?.__type === 'hashpack_usdc_payment_request') {
-                      console.log('[DEBUG] Confirmed hashpack_usdc_payment_request type. Sending USDC payment to client.');
-                      send({ type: 'hashpack_usdc_payment', payment });
-                    } else {
-                      console.log('[DEBUG] textStr included keyword but __type was not hashpack_payment_request. Found type:', payment?.__type);
-                    }
-                  } catch (e) {
-                    console.error('[DEBUG] Failed to parse textStr as JSON even though it contained keyword:', e.message);
-                  }
+              // ── QR code (nb_create_campaign returns a plain string, not JSON) ──
+              if (currentToolName === 'nb_create_campaign') {
+                const votingMatch = textStr.match(/votingUrl:\s*(https?:\/\/\S+)/);
+                if (votingMatch) {
+                  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(votingMatch[1])}`;
+                  console.log('[AGENT API] Sending qr_code event:', qrUrl);
+                  send({ type: 'qr_code', url: qrUrl });
                 }
-              } catch {
-                toolOutputs.push(rawOutput);
               }
+
+              // ── Campaign preview (nb_preview_campaign returns JSON string) ────
+              if (currentToolName === 'nb_preview_campaign') {
+                try {
+                  const preview = JSON.parse(textStr);
+                  if (preview?.__type === 'campaign_preview') {
+                    pendingApproval = preview;
+                    console.log('[AGENT API] Detected campaign preview');
+                    send({ type: 'approval_request', campaignPreview: preview });
+                  }
+                } catch { /* not a JSON preview */ }
+              }
+
+              // ── HashPack / USDC payment request (donate tools return JSON) ───
+              if (textStr.includes('hashpack_payment_request')) {
+                try {
+                  const payment = JSON.parse(textStr);
+                  if (payment?.__type === 'hashpack_payment_request') {
+                    pendingPayment = payment;
+                    send({ type: 'hashpack_payment', payment });
+                  } else if (payment?.__type === 'hashpack_usdc_payment_request') {
+                    send({ type: 'hashpack_usdc_payment', payment });
+                  }
+                } catch (e) {
+                  console.error('[DEBUG] Failed to parse payment JSON:', e.message);
+                }
+              }
+
               send({ type: 'tool_end', step: 'Tool completed' });
             },
             handleLLMStart() {
@@ -405,6 +412,26 @@ app.post('/api/agent', async (req, res) => {
       } catch { /* output is not pure JSON */ }
     }
 
+    // Convert raw qrCodeUrl line → markdown image so ReactMarkdown renders it
+    // as an <img> regardless of which frontend version is deployed.
+    if (output) {
+      output = output.replace(
+        /\bqrCodeUrl:\s*(https?:\/\/\S+)\n?/g,
+        (_, rawUrl) => {
+          let qrUrl = rawUrl;
+          // If the URL went through our /api/qr proxy, rebuild a direct qrserver URL
+          if (!rawUrl.includes('qrserver.com')) {
+            try {
+              const u = new URL(rawUrl);
+              const data = u.searchParams.get('data');
+              if (data) qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${data}`;
+            } catch { /* leave as-is */ }
+          }
+          return `\n![QR Code — Scan to Vote](${qrUrl})\n`;
+        }
+      ).trim();
+    }
+
     // If a HashPack payment is pending, always replace the output entirely
     if (pendingPayment) {
       output = `Please sign the **${pendingPayment.amount} HBAR** donation to **${pendingPayment.campaignName}** using your connected HashPack wallet.`;
@@ -433,7 +460,42 @@ app.post('/api/agent', async (req, res) => {
   }
 });
 
-// ── Generated report downloads (PDF) ─────────────────────────────────────────
+// ── QR code proxy — avoids CSP issues loading api.qrserver.com from Firebase ──
+app.get('/api/qr', async (req, res) => {
+  const { data } = req.query;
+  if (!data) return res.status(400).end();
+  try {
+    const qrResp = await axios.get(
+      `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(data)}`,
+      { responseType: 'arraybuffer', timeout: 10_000 }
+    );
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(qrResp.data));
+  } catch (err) {
+    res.status(502).end();
+  }
+});
+
+// ── On-demand PDF generation — no file storage, works across Cloud Run instances
+app.get('/api/reports/generate/:campaignId', async (req, res) => {
+  const campaignId = parseInt(req.params.campaignId, 10);
+  if (!campaignId) return res.status(400).json({ error: 'Invalid campaign ID' });
+  try {
+    const records = await gatherCampaignRecords(campaignId, 100, 10_000);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="hcs-report-campaign-${campaignId}.pdf"`);
+    const doc = new PDFDocument({ margin: 50, size: 'A4', bufferPages: false });
+    doc.pipe(res);
+    renderHcsPdfContent(doc, records, campaignId);
+    doc.end();
+  } catch (err) {
+    console.error('[PDF] generate error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Generated report downloads (PDF) — kept as fallback for any cached URLs ───
 app.use('/api/reports', express.static(join(__serverDir, 'tmp')));
 
 // ── Guardian indexer proxy — adds Bearer token, returns raw VC JSON ───────────
@@ -563,11 +625,16 @@ if (process.env.NODE_ENV === 'production') {
 const PORT = process.env.PORT || 3001;
 
 console.log('Initializing agents…');
-[researchExecutor, campaignExecutor] = await Promise.all([
-  initResearchAgent(),
-  initCampaignAgent(),
-]);
-console.log('Agents ready.');
+try {
+  [researchExecutor, campaignExecutor] = await Promise.all([
+    initResearchAgent(),
+    initCampaignAgent(),
+  ]);
+  console.log('Agents ready.');
+} catch (err) {
+  console.error('Agent init failed (check HEDERA_ACCOUNT_ID / HEDERA_PRIVATE_KEY env vars):', err.message);
+  console.warn('Server starting without agent capabilities — PDF, proxy, and vote routes still work.');
+}
 
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
